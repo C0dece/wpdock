@@ -241,6 +241,7 @@ function SitePreview({ site, navigate }: { site: WPSite; navigate: (r: AppRoute)
             <button className="btn btn-secondary btn-sm" onClick={() => vscode.postMessage({ type: 'forceRestartSite', payload: { siteId: site.id } })}>🔁 Перезапуск</button>
             <button className="btn btn-secondary btn-sm" onClick={() => vscode.postMessage({ type: 'openBrowser', payload: { url: siteUrl } })}>↗ Сайт</button>
             <button className="btn btn-secondary btn-sm" onClick={() => vscode.postMessage({ type: 'autoLoginAdmin', payload: { siteId: site.id } })}>🔑 Админ</button>
+            <button className={`btn btn-sm ${site.livePreviewRunning ? 'btn-primary' : 'btn-secondary'}`} onClick={() => vscode.postMessage({ type: 'toggleLivePreview', payload: { siteId: site.id } })}>{site.livePreviewRunning ? '🔴 Live Preview' : '👁 Live Preview'}</button>
           </>
         ) : (
           <>

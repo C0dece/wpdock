@@ -28,6 +28,7 @@ export async function activate(context: vscode.ExtensionContext) {
   const processes      = new SiteProcessManager(runtime, proxyRouter);
   const siteManager    = new SiteManager(context, storage, runtime, processes, proxyRouter, sslService);
   const livePreview    = new LivePreviewService();
+  proxyRouter.livePreview = livePreview;
   const gitService     = new GitService();
   const remoteService  = new RemoteService(context, storage);
   const backupService  = new BackupService(context, storage, runtime, siteManager);

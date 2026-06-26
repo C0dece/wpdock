@@ -22,16 +22,6 @@ export class StatusBarManager {
     this.refresh();
   }
 
-  /** @deprecated Use setRuntimeStatus */
-  setDockerStatus(status: 'running' | 'missing' | 'checking'): void {
-    const map: Record<string, Parameters<StatusBarManager['setRuntimeStatus']>[0]> = {
-      running: 'ready',
-      missing: 'not-ready',
-      checking: 'checking',
-    };
-    this.setRuntimeStatus(map[status] ?? 'checking');
-  }
-
   refresh(): void {
     const sites = this.siteManager?.getAllSites() ?? [];
     const startingSites = sites.filter((s) => s.status === 'starting');

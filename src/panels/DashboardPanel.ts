@@ -1379,7 +1379,6 @@ export class DashboardPanel implements vscode.WebviewViewProvider {
           settings: {
             sitesDirectory:       cfg.get<string>('sitesDirectory') ?? '',
             defaultPhpVersion:    cfg.get<string>('defaultPhpVersion') ?? '8.2',
-            livePreviewPort:      cfg.get<number>('livePreviewPort') ?? 3000,
             directUploadLimitMb:  upload.get<number>('directUploadLimitMb') ?? 1,
             chunkSizeMb:          upload.get<number>('chunkSizeMb') ?? 0.75,
             autoBackup:           backup.get<boolean>('autoBackup') ?? false,
@@ -1395,7 +1394,6 @@ export class DashboardPanel implements vscode.WebviewViewProvider {
           const s = payload as {
             sitesDirectory: string;
             defaultPhpVersion: string;
-            livePreviewPort: number;
             directUploadLimitMb: number;
             chunkSizeMb: number;
             autoBackup: boolean;
@@ -1408,7 +1406,6 @@ export class DashboardPanel implements vscode.WebviewViewProvider {
           const backup = vscode.workspace.getConfiguration('wpdock.backup');
           await cfg.update('sitesDirectory',    s.sitesDirectory,    t);
           await cfg.update('defaultPhpVersion', s.defaultPhpVersion, t);
-          await cfg.update('livePreviewPort',   s.livePreviewPort,   t);
           await upload.update('directUploadLimitMb', s.directUploadLimitMb, t);
           await upload.update('chunkSizeMb',         s.chunkSizeMb,         t);
           await backup.update('autoBackup',       s.autoBackup,           t);

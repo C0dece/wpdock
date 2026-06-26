@@ -30,6 +30,7 @@ import * as vscode from 'vscode';
 import { WPSite } from '../types';
 import { Logger } from '../utils/logger';
 import { runElevated, runElevatedPs } from '../utils/elevate';
+import type { LivePreviewProxyHandler } from './LivePreviewService';
 
 const PORTPROXY_HTTP_PORT  = 80;
 const PORTPROXY_HTTPS_PORT = 443;
@@ -48,6 +49,11 @@ export class ProxyRouterService {
 
   private started = false;
   private _portProxyActive = false;
+  /** True when bound directly to :80 (VS Code running as admin) — no portproxy needed. */
+  private _directBind = false;
+
+  /** Optional live-reload handler. Same-origin requests under its path prefix are served by it. */
+  livePreview?: LivePreviewProxyHandler;
 
   private normalizeHost(value: string | undefined): string {
     if (!value) {return '';}
@@ -70,10 +76,15 @@ export class ProxyRouterService {
     this.started = true;
 
     // 1. Try port 80 directly (works when VS Code is run as administrator).
+    //    In this mode we also serve HTTPS on :443 directly — no portproxy is
+    //    needed (or even possible, since :80/:443 are already bound here).
     try {
       await this.bindHttpPort(80, '0.0.0.0');
       this._port = 80;
-      Logger.log('[ProxyRouter] bound to port 80 (admin mode)');
+      this._httpsPort = PORTPROXY_HTTPS_PORT; // 443 — HTTPS server starts lazily on registerSni
+      this._directBind = true;
+      Logger.log('[ProxyRouter] bound to port 80 (admin mode) — direct bind, portproxy skipped');
+      this.activatePortlessUrls();
       return;
     } catch { /* not admin — continue */ }
 
@@ -144,6 +155,8 @@ export class ProxyRouterService {
     this.started = false;
     this._port      = 0;
     this._httpsPort = 0;
+    this._directBind = false;
+    this._portProxyActive = false;
   }
 
   // ── Route management ──────────────────────────────────────────────────────
@@ -247,13 +260,19 @@ export class ProxyRouterService {
       })
       .join(', ');
 
-    const script = [
-      `$ErrorActionPreference = 'Stop'`,
+    // In direct-bind (admin) mode :80/:443 are served by this process directly,
+    // so no portproxy rules are added — only the hosts entries are written.
+    const portProxyCmds = this._directBind ? [] : [
       `netsh interface portproxy delete v4tov4 listenaddress=0.0.0.0 listenport=${PORTPROXY_HTTP_PORT} 2>$null`,
       `netsh interface portproxy delete v4tov4 listenaddress=169.254.192.1 listenport=${PORTPROXY_HTTP_PORT} 2>$null`,
       `netsh interface portproxy delete v4tov4 listenaddress=0.0.0.0 listenport=${PORTPROXY_HTTPS_PORT} 2>$null`,
       `netsh interface portproxy add v4tov4 listenaddress=0.0.0.0 listenport=${PORTPROXY_HTTP_PORT} connectaddress=127.0.0.1 connectport=${this._port}`,
       `netsh interface portproxy add v4tov4 listenaddress=0.0.0.0 listenport=${PORTPROXY_HTTPS_PORT} connectaddress=127.0.0.1 connectport=${this._httpsPort}`,
+    ];
+
+    const script = [
+      `$ErrorActionPreference = 'Stop'`,
+      ...portProxyCmds,
       `$entries = @(${psEntries})`,
       `$hostsAccount = New-Object System.Security.Principal.NTAccount($env:USERDOMAIN, $env:USERNAME)`,
       `$hostsAcl = Get-Acl '${hostsPath}'`,
@@ -336,6 +355,13 @@ export class ProxyRouterService {
 
   private handleRequest(req: http.IncomingMessage, res: http.ServerResponse): void {
     const hostname    = this.normalizeHost(req.headers.host);
+
+    // Live-reload client + SSE stream ride the site's own origin (handled before routing).
+    if (this.livePreview?.isLivePreviewPath(req.url)) {
+      this.livePreview.handleProxyRequest(req, res, hostname);
+      return;
+    }
+
     const route = this.routes.get(hostname);
 
     if (!route) {

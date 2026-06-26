@@ -345,6 +345,7 @@ export default function SiteDetailPage({ siteId, sites, remotes, navigate, onToa
               <button className="btn btn-secondary" onClick={() => vscode.postMessage({ type: 'forceRestartSite', payload: { siteId } })}>🔁 Перезапустить</button>
               <button className="btn btn-secondary" onClick={() => vscode.postMessage({ type: 'openBrowser', payload: { url: siteUrl } })}>🌐 Сайт</button>
               <button className="btn btn-secondary" onClick={() => vscode.postMessage({ type: 'autoLoginAdmin', payload: { siteId } })}>🔑 Админ</button>
+              <button className={`btn ${site.livePreviewRunning ? 'btn-primary' : 'btn-secondary'}`} title="Авто-перезагрузка страницы при изменении файлов wp-content" onClick={() => vscode.postMessage({ type: 'toggleLivePreview', payload: { siteId } })}>{site.livePreviewRunning ? '🔴 Live Preview' : '👁 Live Preview'}</button>
             </>
           ) : (
             <>

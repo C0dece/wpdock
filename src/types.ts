@@ -114,13 +114,6 @@ export interface RuntimeStatus {
   mariadbInstalled: boolean;
 }
 
-/** @deprecated Use RuntimeStatus — Docker is no longer required. */
-export interface DockerStatus {
-  available: boolean;
-  version?: string;
-  installRequired: boolean;
-}
-
 export type DashboardRoute =
   | 'home'
   | 'create-site'

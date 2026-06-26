@@ -10,7 +10,6 @@ interface Props {
 interface PluginSettings {
   sitesDirectory: string;
   defaultPhpVersion: string;
-  livePreviewPort: number;
   directUploadLimitMb: number;
   chunkSizeMb: number;
   autoBackup: boolean;
@@ -30,7 +29,6 @@ const BACKUP_INTERVALS = [
 const DEFAULTS: PluginSettings = {
   sitesDirectory: '',
   defaultPhpVersion: '8.2',
-  livePreviewPort: 3000,
   directUploadLimitMb: 1,
   chunkSizeMb: 0.75,
   autoBackup: false,
@@ -84,16 +82,14 @@ export default function SettingsPage({ navigate, onToast }: Props) {
             <div className="site-card-meta-row">
               <span className="badge badge-green">global</span>
               <span className="site-card-chip">PHP {settings.defaultPhpVersion}</span>
-              <span className="site-card-chip">preview {settings.livePreviewPort}</span>
             </div>
             <div className="detail-summary-grid">
               <div className="overview-stat"><span className="overview-stat-value">{settings.defaultPhpVersion}</span><span className="overview-stat-label">php</span></div>
-              <div className="overview-stat"><span className="overview-stat-value">{settings.livePreviewPort}</span><span className="overview-stat-label">preview</span></div>
               <div className="overview-stat"><span className="overview-stat-value">{settings.autoBackup ? 'on' : 'off'}</span><span className="overview-stat-label">backup</span></div>
               <div className="overview-stat"><span className="overview-stat-value">{settings.directUploadLimitMb}mb</span><span className="overview-stat-label">upload</span></div>
             </div>
             <div className="section-copy">
-              Здесь задаются глобальные значения по умолчанию для новых сайтов, live preview и push/backup поведения.
+              Здесь задаются глобальные значения по умолчанию для новых сайтов, загрузки на сервер и push/backup поведения.
             </div>
           </div>
 
@@ -111,10 +107,6 @@ export default function SettingsPage({ navigate, onToast }: Props) {
                   <select className="form-input" value={settings.defaultPhpVersion} onChange={(e) => set('defaultPhpVersion', e.target.value)}>
                     {PHP_VERSIONS.map((v) => <option key={v} value={v}>{v}</option>)}
                   </select>
-                </div>
-                <div className="form-group">
-                  <label className="form-label">Порт Live Preview</label>
-                  <input className="form-input" type="number" min={1024} max={65535} value={settings.livePreviewPort} onChange={(e) => set('livePreviewPort', Number(e.target.value))} />
                 </div>
               </div>
             </section>

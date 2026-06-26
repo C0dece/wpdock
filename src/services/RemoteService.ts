@@ -131,6 +131,44 @@ const PUSH_AGGRESSIVE_DEV_FILTERS = [
   '**/.nuxt/**',
 ];
 
+// Exclude patterns for the native bsdtar packer. bsdtar's `*` matches across `/`,
+// so a single `*/x/*` covers any depth. Mirrors PUSH_IGNORE_PATTERNS. The remote
+// agent additionally refuses to overwrite wpdock-agent, but we still exclude it
+// here to save bandwidth.
+const PUSH_TAR_EXCLUDES = [
+  '*/.*',                              // nested dotfiles/dirs (matches archiver dot:false)
+  '*/node_modules/*', 'node_modules/*',
+  '*/.git/*', '.git/*', '*/.git', '.git',
+  '*/.gitignore', '.gitignore',
+  'wp-config.php', '*/wp-config.php',
+  'database.sql', '*/database.sql',
+  '*.DS_Store', 'Thumbs.db', 'thumbs.db',
+  'wp-content/cache/*', 'wp-content/cache',
+  'wp-content/upgrade/*',
+  'wp-content/backup/*',
+  'wp-content/debug.log',
+  'wp-content/plugins/wpdock-agent/*', 'wp-content/plugins/wpdock-agent',
+  'wp-content/plugins/wpdock-agent.php',
+  '*.swp', '*.swo',
+  '.env.local', '*/.env.local',
+];
+
+// Extra aggressive excludes for dev mode (mirror PUSH_AGGRESSIVE_DEV_FILTERS).
+const PUSH_TAR_EXCLUDES_DEV = [
+  ...PUSH_TAR_EXCLUDES,
+  'wp-content/uploads/*', 'wp-content/uploads',
+  '*/vendor/*',
+  '*/dist/*', '*/build/*',
+  '*/.turbo/*', '*/.next/*', '*/.nuxt/*',
+];
+
+// Top-level entries inside the WP root that are never packed (handled as members,
+// not glob excludes, so bsdtar never even descends into them).
+const PUSH_TAR_TOPLEVEL_SKIP = new Set([
+  'wp-config.php', 'database.sql', '.gitignore', '.git',
+  'node_modules', '.vscode', '.idea', '.DS_Store', 'Thumbs.db', 'thumbs.db',
+]);
+
 export interface AgentInstallDiagnostic {
   code: string;
   title: string;
@@ -1709,9 +1747,26 @@ if (!defined('ABSPATH')) { exit; }
     const packStart = Date.now();
     const archiver = (await import('archiver')).default;
     const zipPath = path.join(os.tmpdir(), `wpdock-push-${Date.now()}.zip`);
+
+    // Packaging emits no intrinsic progress, so without a heartbeat the UI sits
+    // frozen at 10% for the whole archive build. Tick live elapsed time + packed
+    // object count (fed by the packer) so the user always sees activity.
+    let packedCount = 0;
+    const packHeartbeat = setInterval(() => {
+      // onProgress may throw on cancellation; swallow it inside the timer (the
+      // main flow re-checks cancellation right after packaging).
+      try {
+        const secs = Math.round((Date.now() - packStart) / 1000);
+        const pct = Math.min(28, 11 + secs);
+        const countPart = packedCount > 0 ? ` — ${packedCount} объектов` : '';
+        onProgress('packaging', `Подготовка локальных файлов… ${secs} c${countPart}`, pct);
+      } catch { /* ignore — cancellation handled by the awaited path */ }
+    }, 800);
+
     try {
-      await this.createZip(localPath, zipPath, archiver, devMode);
-      
+      await this.createZip(localPath, zipPath, archiver, devMode, true, (n) => { packedCount = n; });
+      clearInterval(packHeartbeat);
+
       const zipStats = fs.statSync(zipPath);
       const packElapsed = Date.now() - packStart;
       markTime('createZip');
@@ -1818,6 +1873,7 @@ if (!defined('ABSPATH')) { exit; }
       );
       onProgress('done', 'Push завершен!', 100);
     } finally {
+      clearInterval(packHeartbeat);
       if (fs.existsSync(zipPath)) {
         try {
           fs.unlinkSync(zipPath);
@@ -3573,7 +3629,135 @@ if (!defined('ABSPATH')) { exit; }
     return path.join(this.context.extensionPath, 'resources', 'wpdock-agent.zip');
   }
 
-  private createZip(sourceDir: string, destZip: string, archiver: any, devMode: boolean = false, enableLogging: boolean = true): Promise<void> {
+  /**
+   * Detects the legacy layout where the real wp-content lives next to (not inside)
+   * the WP root and the in-root wp-content is missing or a symlink. The native
+   * packer can't remap such a path, so this gates the archiver fallback.
+   */
+  private hasExternalWpContent(sourceDir: string): boolean {
+    const normalized = path.resolve(sourceDir);
+    const externalWpContentDir = path.resolve(path.dirname(normalized), 'wp-content');
+    const internalWpContentDir = path.resolve(normalized, 'wp-content');
+    return (
+      fs.existsSync(externalWpContentDir) &&
+      externalWpContentDir !== internalWpContentDir &&
+      fs.statSync(externalWpContentDir).isDirectory() &&
+      (!fs.existsSync(internalWpContentDir) || fs.lstatSync(internalWpContentDir).isSymbolicLink())
+    );
+  }
+
+  /**
+   * Packs the WP root into a ZIP for push. Prefers native bsdtar (tar.exe on
+   * Windows 10+) which packs tens of thousands of wp-content files in seconds;
+   * pure-JS archiver does the same in minutes. Falls back to archiver on any
+   * problem or for the legacy external-wp-content layout. `onPacked` reports the
+   * running object count so the caller can show live packaging progress.
+   */
+  private async createZip(
+    sourceDir: string,
+    destZip: string,
+    archiver: any,
+    devMode: boolean = false,
+    enableLogging: boolean = true,
+    onPacked?: (count: number) => void
+  ): Promise<void> {
+    if (process.platform === 'win32' && !this.hasExternalWpContent(sourceDir)) {
+      try {
+        await this.createZipNative(sourceDir, destZip, devMode, enableLogging, onPacked);
+        return;
+      } catch (err: any) {
+        if (enableLogging) {
+          Logger.log(`[ZIP] native tar failed (${err?.message ?? err}); fallback → archiver`);
+        }
+        try { fs.rmSync(destZip, { force: true }); } catch { /* ignore */ }
+      }
+    }
+    await this.createZipArchiver(sourceDir, destZip, archiver, devMode, enableLogging, onPacked);
+  }
+
+  /** Native bsdtar packer. See createZip() for rationale. */
+  private async createZipNative(
+    sourceDir: string,
+    destZip: string,
+    devMode: boolean,
+    enableLogging: boolean,
+    onPacked?: (count: number) => void
+  ): Promise<void> {
+    const tarBin = (() => {
+      const sys = path.join(process.env.WINDIR || 'C:\\Windows', 'System32', 'tar.exe');
+      return fs.existsSync(sys) ? sys : 'tar';
+    })();
+
+    // Top-level members to pack, dropping never-shipped entries so bsdtar never
+    // descends into them. `--dereference` follows a wp-content junction/symlink.
+    // Skip dotfiles/dirs (matches archiver's dot:false — avoids pushing local
+    // .htaccess/.user.ini over the remote's) and the never-shipped entries.
+    const members = fs.readdirSync(sourceDir)
+      .filter((name) => !name.startsWith('.') && !PUSH_TAR_TOPLEVEL_SKIP.has(name));
+    if (members.length === 0) {
+      throw new Error('nothing to pack (empty WP root)');
+    }
+
+    const excludes = devMode ? PUSH_TAR_EXCLUDES_DEV : PUSH_TAR_EXCLUDES;
+    const excludeArgs: string[] = [];
+    for (const ex of excludes) { excludeArgs.push('--exclude', ex); }
+
+    const args = [
+      '--format=zip',
+      `--options=zip:compression=${devMode ? 'store' : 'deflate'}`,
+      '--dereference',
+      '-v',
+      ...excludeArgs,
+      '-c', '-f', destZip,
+      '-C', sourceDir,
+      ...members,
+    ];
+
+    if (enableLogging) {
+      Logger.log(
+        `[ZIP] native tar bin=${tarBin} devMode=${devMode} members=${members.length} ` +
+        `excludes=${excludes.length} compression=${devMode ? 'store' : 'deflate'}`
+      );
+    }
+
+    let packed = 0;
+    let stderrTail = '';
+    // bsdtar prints one path per line in verbose mode; depending on the build it
+    // goes to stdout or stderr, so count newlines on both.
+    const countLines = (s: string) => {
+      for (let i = 0; i < s.length; i++) { if (s.charCodeAt(i) === 10) { packed++; } }
+      onPacked?.(packed);
+    };
+
+    await new Promise<void>((resolve, reject) => {
+      const proc = cp.spawn(tarBin, args, { windowsHide: true });
+      proc.stdout?.on('data', (d) => countLines(d.toString()));
+      proc.stderr?.on('data', (d) => {
+        const s = d.toString();
+        countLines(s);
+        stderrTail = (stderrTail + s).slice(-2000);
+      });
+      proc.on('error', reject); // tar missing / failed to launch
+      proc.on('close', (code) => {
+        const size = fs.existsSync(destZip) ? fs.statSync(destZip).size : 0;
+        // code 1 = warnings (e.g. a file vanished mid-pack). Accept if archive exists.
+        if (code === 0 || (code === 1 && size > 0)) {
+          resolve();
+        } else {
+          reject(new Error(`tar exit ${code}: ${stderrTail.slice(-500)}`));
+        }
+      });
+    });
+
+    const size = fs.existsSync(destZip) ? fs.statSync(destZip).size : 0;
+    if (size === 0) { throw new Error('native zip produced empty file'); }
+    if (enableLogging) {
+      Logger.log(`[ZIP] native tar created path=${destZip} size=${this.formatBytes(size)} objects=${packed}`);
+    }
+  }
+
+  /** Pure-JS archiver packer — fallback path. */
+  private createZipArchiver(sourceDir: string, destZip: string, archiver: any, devMode: boolean = false, enableLogging: boolean = true, onPacked?: (count: number) => void): Promise<void> {
     return new Promise((resolve, reject) => {
       const normalizedSourceDir = path.resolve(sourceDir);
       const externalWpContentDir = path.resolve(path.dirname(normalizedSourceDir), 'wp-content');
@@ -3608,6 +3792,10 @@ if (!defined('ABSPATH')) { exit; }
         resolve();
       });
       archive.on('error', reject);
+      if (onPacked) {
+        let packed = 0;
+        archive.on('entry', () => { onPacked(++packed); });
+      }
       archive.pipe(output);
 
       // ✅ OPTIMIZATION: Use aggressive filters in dev mode to exclude uploads and build artifacts

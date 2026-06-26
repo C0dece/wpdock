@@ -1,7 +1,7 @@
 {
   "name": "wpdock",
   "displayName": "WPDock",
-  "description": "Local WordPress development environment in VS Code — Docker-powered, deploy-ready, GitHub-integrated",
+  "description": "Local WordPress development environment in VS Code — portable PHP + MariaDB runtime (no Docker), deploy-ready, GitHub-integrated",
   "version": "0.1.0",
   "publisher": "wpdock",
   "author": "C0dece",
@@ -23,8 +23,8 @@
   ],
   "keywords": [
     "wordpress",
-    "docker",
     "local",
+    "localwp",
     "deploy",
     "wp"
   ],
@@ -308,11 +308,6 @@
           "default": "",
           "description": "Папка, где хранятся локальные WordPress-сайты"
         },
-        "wpdock.dockerPath": {
-          "type": "string",
-          "default": "auto",
-          "description": "Путь к Docker executable (auto = автоопределение)"
-        },
         "wpdock.cloud.yandexClientId": {
           "type": "string",
           "default": "",
@@ -354,11 +349,6 @@
             "8.3"
           ],
           "description": "Версия PHP по умолчанию для новых сайтов"
-        },
-        "wpdock.livePreviewPort": {
-          "type": "number",
-          "default": 3000,
-          "description": "Порт для BrowserSync Live Preview"
         },
         "wpdock.backup.autoBackup": {
           "type": "boolean",
@@ -447,16 +437,11 @@
   "dependencies": {
     "adm-zip": "^0.5.10",
     "archiver": "^6.0.1",
-    "browser-sync": "^3.0.2",
     "chokidar": "^3.5.3",
-    "dockerode": "^4.0.0",
-    "extract-zip": "^2.0.1",
     "fflate": "^0.8.3",
     "form-data": "^4.0.0",
-    "mysql2": "^3.6.5",
     "node-fetch": "^2.7.0",
     "simple-git": "^3.22.0",
-    "ssh2": "^1.15.0",
     "uuid": "^9.0.1"
   }
 }

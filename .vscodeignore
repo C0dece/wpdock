@@ -1,0 +1,15 @@
+.vscode/
+node_modules/
+webview-ui/node_modules/
+webview-ui/src/
+webview-ui/index.html
+webview-ui/tsconfig.json
+webview-ui/vite.config.ts
+webview-ui/package.json
+webview-ui/package-lock.json
+src/
+scripts/
+tsconfig.json
+docs/
+*.vsix
+*.log

@@ -1,0 +1,462 @@
+{
+  "name": "wpdock",
+  "displayName": "WPDock",
+  "description": "Local WordPress development environment in VS Code — Docker-powered, deploy-ready, GitHub-integrated",
+  "version": "0.1.0",
+  "publisher": "wpdock",
+  "author": "C0dece",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/C0dece/wpdock.git"
+  },
+  "homepage": "https://github.com/C0dece/wpdock#readme",
+  "bugs": {
+    "url": "https://github.com/C0dece/wpdock/issues"
+  },
+  "icon": "resources/icon.png",
+  "engines": {
+    "vscode": "^1.106.0"
+  },
+  "categories": [
+    "Other"
+  ],
+  "keywords": [
+    "wordpress",
+    "docker",
+    "local",
+    "deploy",
+    "wp"
+  ],
+  "activationEvents": [
+    "onStartupFinished",
+    "onUri"
+  ],
+  "main": "./out/extension.js",
+  "contributes": {
+    "viewsContainers": {
+      "activitybar": [
+        {
+          "id": "wpdock",
+          "title": "WPDock",
+          "icon": "./resources/wpdock.svg"
+        }
+      ],
+      "secondarySidebar": [
+        {
+          "id": "wpdockProject",
+          "title": "WPDock Project",
+          "icon": "./resources/wpdock.svg"
+        }
+      ]
+    },
+    "views": {
+      "wpdock": [
+        {
+          "id": "wpdock.launcher",
+          "name": "",
+          "type": "webview"
+        }
+      ],
+      "wpdockProject": [
+        {
+          "id": "wpdock.project",
+          "name": "Текущий сайт",
+          "type": "webview",
+          "contextualTitle": "WPDock Project"
+        }
+      ]
+    },
+    "commands": [
+      {
+        "command": "wpdock.showLogs",
+        "title": "Показать логи WPDock",
+        "category": "WPDock",
+        "icon": "$(output)"
+      },
+      {
+        "command": "wpdock.configureDirectUploadLimit",
+        "title": "Настроить лимит прямой загрузки",
+        "category": "WPDock",
+        "icon": "$(cloud-upload)"
+      },
+      {
+        "command": "wpdock.configureUploadSize",
+        "title": "Настроить размер чанка загрузки",
+        "category": "WPDock",
+        "icon": "$(settings)"
+      },
+      {
+        "command": "wpdock.openDashboard",
+        "title": "Показать WPDock в боковой панели",
+        "category": "WPDock",
+        "icon": "$(browser)"
+      },
+      {
+        "command": "wpdock.openProjectSite",
+        "title": "Открыть WPDock для текущего проекта",
+        "category": "WPDock",
+        "icon": "$(layout-sidebar-right)"
+      },
+      {
+        "command": "wpdock.createSite",
+        "title": "Создать новый сайт",
+        "category": "WPDock",
+        "icon": "$(add)"
+      },
+      {
+        "command": "wpdock.startSite",
+        "title": "Запустить сайт",
+        "category": "WPDock",
+        "icon": "$(play)"
+      },
+      {
+        "command": "wpdock.stopSite",
+        "title": "Остановить сайт",
+        "category": "WPDock",
+        "icon": "$(stop)"
+      },
+      {
+        "command": "wpdock.forceStopSite",
+        "title": "Принудительно остановить сайт",
+        "category": "WPDock",
+        "icon": "$(debug-stop)"
+      },
+      {
+        "command": "wpdock.forceRestartSite",
+        "title": "Убить процессы и перезапустить сайт",
+        "category": "WPDock",
+        "icon": "$(debug-restart)"
+      },
+      {
+        "command": "wpdock.deleteSite",
+        "title": "Удалить сайт",
+        "category": "WPDock",
+        "icon": "$(trash)"
+      },
+      {
+        "command": "wpdock.openAdminSite",
+        "title": "Открыть админку WP",
+        "category": "WPDock",
+        "icon": "$(link-external)"
+      },
+      {
+        "command": "wpdock.openSite",
+        "title": "Открыть сайт",
+        "category": "WPDock",
+        "icon": "$(globe)"
+      },
+      {
+        "command": "wpdock.livePreview",
+        "title": "Переключить Live Preview",
+        "category": "WPDock",
+        "icon": "$(eye)"
+      },
+      {
+        "command": "wpdock.connectRemote",
+        "title": "Подключить удалённый сайт",
+        "category": "WPDock",
+        "icon": "$(cloud)"
+      },
+      {
+        "command": "wpdock.pullRemote",
+        "title": "Pull с удалённого",
+        "category": "WPDock",
+        "icon": "$(cloud-download)"
+      },
+      {
+        "command": "wpdock.pushRemote",
+        "title": "Push на удалённый",
+        "category": "WPDock",
+        "icon": "$(cloud-upload)"
+      },
+      {
+        "command": "wpdock.editRemote",
+        "title": "Редактировать удалённый сайт",
+        "category": "WPDock",
+        "icon": "$(edit)"
+      },
+      {
+        "command": "wpdock.openRemote",
+        "title": "Открыть удалённый сайт",
+        "category": "WPDock",
+        "icon": "$(go-to-file)"
+      },
+      {
+        "command": "wpdock.deleteRemote",
+        "title": "Удалить удалённый сайт",
+        "category": "WPDock",
+        "icon": "$(trash)"
+      },
+      {
+        "command": "wpdock.deployGit",
+        "title": "Деплой через GitHub Actions",
+        "category": "WPDock",
+        "icon": "$(rocket)"
+      },
+      {
+        "command": "wpdock.initGit",
+        "title": "Инициализировать Git-репозиторий",
+        "category": "WPDock",
+        "icon": "$(git-init)"
+      },
+      {
+        "command": "wpdock.importSite",
+        "title": "Импортировать сайт из ZIP",
+        "category": "WPDock",
+        "icon": "$(cloud-download)"
+      },
+      {
+        "command": "wpdock.backupSite",
+        "title": "Сделать бэкап сайта",
+        "category": "WPDock",
+        "icon": "$(archive)"
+      },
+      {
+        "command": "wpdock.fullBackup",
+        "title": "Полный бэкап (локально + облако + Git)",
+        "category": "WPDock",
+        "icon": "$(save-all)"
+      },
+      {
+        "command": "wpdock.githubManager",
+        "title": "Менеджер GitHub",
+        "category": "WPDock",
+        "icon": "$(github)"
+      }
+    ],
+    "menus": {
+      "view/title": [],
+      "view/item/context": [
+        {
+          "command": "wpdock.startSite",
+          "when": "view == wpdock.sites && viewItem == site-stopped",
+          "group": "inline"
+        },
+        {
+          "command": "wpdock.stopSite",
+          "when": "view == wpdock.sites && viewItem == site-running",
+          "group": "inline"
+        },
+        {
+          "command": "wpdock.forceRestartSite",
+          "when": "view == wpdock.sites",
+          "group": "inline"
+        },
+        {
+          "command": "wpdock.forceStopSite",
+          "when": "view == wpdock.sites",
+          "group": "context"
+        },
+        {
+          "command": "wpdock.openAdminSite",
+          "when": "view == wpdock.sites && viewItem == site-running",
+          "group": "context"
+        },
+        {
+          "command": "wpdock.openSite",
+          "when": "view == wpdock.sites && viewItem == site-running",
+          "group": "context"
+        },
+        {
+          "command": "wpdock.livePreview",
+          "when": "view == wpdock.sites && viewItem == site-running",
+          "group": "context"
+        },
+        {
+          "command": "wpdock.fullBackup",
+          "when": "view == wpdock.sites",
+          "group": "context"
+        },
+        {
+          "command": "wpdock.backupSite",
+          "when": "view == wpdock.sites",
+          "group": "context"
+        },
+        {
+          "command": "wpdock.pullRemote",
+          "when": "view == wpdock.remotes && viewItem == remote-site",
+          "group": "inline"
+        },
+        {
+          "command": "wpdock.pushRemote",
+          "when": "view == wpdock.remotes && viewItem == remote-site",
+          "group": "inline"
+        },
+        {
+          "command": "wpdock.editRemote",
+          "when": "view == wpdock.remotes && viewItem == remote-site",
+          "group": "context"
+        },
+        {
+          "command": "wpdock.openRemote",
+          "when": "view == wpdock.remotes && viewItem == remote-site",
+          "group": "context"
+        },
+        {
+          "command": "wpdock.deleteRemote",
+          "when": "view == wpdock.remotes && viewItem == remote-site",
+          "group": "context"
+        }
+      ]
+    },
+    "configuration": {
+      "title": "WPDock",
+      "properties": {
+        "wpdock.sitesDirectory": {
+          "type": "string",
+          "default": "",
+          "description": "Папка, где хранятся локальные WordPress-сайты"
+        },
+        "wpdock.dockerPath": {
+          "type": "string",
+          "default": "auto",
+          "description": "Путь к Docker executable (auto = автоопределение)"
+        },
+        "wpdock.cloud.yandexClientId": {
+          "type": "string",
+          "default": "",
+          "description": "Встроенный Yandex OAuth Client ID для browser auth без ручного ввода в UI"
+        },
+        "wpdock.cloud.yandexClientSecret": {
+          "type": "string",
+          "default": "",
+          "description": "Встроенный Yandex OAuth Client Secret для browser auth без ручного ввода в UI"
+        },
+        "wpdock.cloud.yandexFolder": {
+          "type": "string",
+          "default": "/WPDock",
+          "description": "Папка Yandex Disk по умолчанию для browser auth"
+        },
+        "wpdock.cloud.googleClientId": {
+          "type": "string",
+          "default": "",
+          "description": "Встроенный Google OAuth Client ID для browser auth без ручного ввода в UI"
+        },
+        "wpdock.cloud.googleClientSecret": {
+          "type": "string",
+          "default": "",
+          "description": "Встроенный Google OAuth Client Secret для browser auth без ручного ввода в UI"
+        },
+        "wpdock.cloud.googleFolderId": {
+          "type": "string",
+          "default": "",
+          "description": "Google Drive Folder ID по умолчанию для browser auth"
+        },
+        "wpdock.defaultPhpVersion": {
+          "type": "string",
+          "default": "8.2",
+          "enum": [
+            "7.4",
+            "8.0",
+            "8.1",
+            "8.2",
+            "8.3"
+          ],
+          "description": "Версия PHP по умолчанию для новых сайтов"
+        },
+        "wpdock.livePreviewPort": {
+          "type": "number",
+          "default": 3000,
+          "description": "Порт для BrowserSync Live Preview"
+        },
+        "wpdock.backup.autoBackup": {
+          "type": "boolean",
+          "default": false,
+          "description": "Включить автоматические бэкапы по расписанию"
+        },
+        "wpdock.backup.intervalHours": {
+          "type": "number",
+          "default": 24,
+          "enum": [
+            6,
+            12,
+            24,
+            48,
+            168
+          ],
+          "enumDescriptions": [
+            "Каждые 6 часов",
+            "Каждые 12 часов",
+            "Ежедневно",
+            "Каждые 2 дня",
+            "Еженедельно"
+          ],
+          "description": "Как часто выполнять автобэкап"
+        },
+        "wpdock.backup.keepCount": {
+          "type": "number",
+          "default": 5,
+          "description": "Максимальное число локальных бэкапов на сайт"
+        },
+        "wpdock.remoteUpload.directUploadLimitMb": {
+          "type": "number",
+          "default": 1,
+          "minimum": 0.5,
+          "maximum": 1024,
+          "description": "Максимальный размер файла для одиночной загрузки без чанков. Если файл больше, WPDock переключится на chunk upload. Для хостинга с лимитом 300 МБ можно поставить 300."
+        },
+        "wpdock.remoteUpload.chunkSizeMb": {
+          "type": "number",
+          "default": 0.75,
+          "minimum": 0.25,
+          "maximum": 128,
+          "description": "Размер одного чанка при batched upload. Увеличивайте только если хостинг стабильно принимает более крупные POST-запросы. Если хост отклонит слишком большой чанк (413), WPDock автоматически уменьшит размер вдвое и повторит — push не упадёт."
+        },
+        "wpdock.remoteUpload.concurrency": {
+          "type": "number",
+          "default": 8,
+          "minimum": 1,
+          "maximum": 16,
+          "description": "Сколько чанков загружать параллельно при push. Больше потоков лучше насыщают канал, но на слабом shared-хостинге может исчерпать пул PHP-воркеров — тогда уменьшите."
+        }
+      }
+    }
+  },
+  "scripts": {
+    "vscode:prepublish": "npm run pack-agent && npm run bundle && npm run build:webview",
+    "compile": "npm run bundle && npm run build:webview",
+    "bundle": "node scripts/build-extension.js",
+    "bundle:dev": "node scripts/build-extension.js --dev",
+    "build:webview": "cd webview-ui && npm run build",
+    "watch": "node scripts/build-extension.js --dev",
+    "watch:webview": "cd webview-ui && npm run dev",
+    "pack-agent": "node scripts/pack-agent.js",
+    "lint": "eslint src --ext ts",
+    "postinstall": "cd webview-ui && npm install",
+    "pretest": "npm run compile",
+    "test": "node ./out/test/runTest.js",
+    "package": "npm run pack-agent && vsce package",
+    "deploy:local": "powershell -ExecutionPolicy Bypass -File scripts/deploy-local.ps1",
+    "smoke:local": "powershell -ExecutionPolicy Bypass -File scripts/smoke-local.ps1 -SiteName test1"
+  },
+  "devDependencies": {
+    "@types/adm-zip": "^0.5.8",
+    "@types/archiver": "^6.0.4",
+    "@types/node": "^20.0.0",
+    "@types/node-fetch": "^2.6.12",
+    "@types/uuid": "^9.0.8",
+    "@types/vscode": "^1.85.0",
+    "@typescript-eslint/eslint-plugin": "^6.0.0",
+    "@typescript-eslint/parser": "^6.0.0",
+    "@vscode/vsce": "^3.9.1",
+    "esbuild": "^0.28.0",
+    "eslint": "^8.57.1",
+    "typescript": "^5.3.0"
+  },
+  "dependencies": {
+    "adm-zip": "^0.5.10",
+    "archiver": "^6.0.1",
+    "browser-sync": "^3.0.2",
+    "chokidar": "^3.5.3",
+    "dockerode": "^4.0.0",
+    "extract-zip": "^2.0.1",
+    "fflate": "^0.8.3",
+    "form-data": "^4.0.0",
+    "mysql2": "^3.6.5",
+    "node-fetch": "^2.7.0",
+    "simple-git": "^3.22.0",
+    "ssh2": "^1.15.0",
+    "uuid": "^9.0.1"
+  }
+}

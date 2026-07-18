@@ -272,6 +272,10 @@ export default function App() {
           hideGlobalProgress();
           setAgentInstallDiagnostics((prev) => ({ ...prev, [msg.remoteId]: msg.diagnostic ?? null }));
           break;
+        case 'remoteUploadResidueCleaned':
+          hideGlobalProgress();
+          addToast(`Остатки Push очищены${msg.result?.bytes_deleted_human ? `: ${msg.result.bytes_deleted_human}` : ''}.`, 'success');
+          break;
         case 'agentInstalled':
           hideGlobalProgress();
           addToast('WPDock агент установлен на удалённом сайте.', 'success');

@@ -86,8 +86,20 @@ export class StorageService implements vscode.Disposable {
       : typeof remote?.linkedSiteId === 'string' && remote.linkedSiteId
         ? [remote.linkedSiteId]
         : [];
+    const fileTransferMode = remote?.fileTransferMode === 'ftp' ? 'ftp' : 'agent';
+    const ftp = remote?.ftp && typeof remote.ftp === 'object'
+      ? {
+          host: typeof remote.ftp.host === 'string' ? remote.ftp.host : '',
+          port: Number.isFinite(remote.ftp.port) ? Number(remote.ftp.port) : undefined,
+          username: typeof remote.ftp.username === 'string' ? remote.ftp.username : '',
+          rootPath: typeof remote.ftp.rootPath === 'string' ? remote.ftp.rootPath : '/',
+          secure: Boolean(remote.ftp.secure),
+        }
+      : undefined;
     return {
       ...remote,
+      fileTransferMode,
+      ftp,
       linkedSiteIds,
       syncHistory: Array.isArray(remote?.syncHistory) ? remote.syncHistory.slice(0, 50) : [],
     };

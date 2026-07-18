@@ -23,11 +23,17 @@ const SITE_PROBE_FAILURES_BEFORE_RECOVERY = 3;
 const SITE_AUTO_RECOVERY_COOLDOWN_MS = 30_000;
 const STARTING_STATUS_STALE_MS = 5 * 60_000;
 /**
- * A runtime ownership lock is considered "live" only if its heartbeat is fresher
- * than this. The owner refreshes it every sync tick (~3s); a generous window
- * tolerates a few missed ticks but still expires quickly after a window closes.
+ * A runtime ownership lock is considered "fresh" when its heartbeat is newer
+ * than this. The owner refreshes it every sync tick (~3s); sync code is allowed
+ * to be more conservative before treating a live PID as dead.
  */
 const RUNTIME_LOCK_FRESH_MS = 15_000;
+/**
+ * If the owner PID still exists, keep treating the lock as live for a longer
+ * grace period. This prevents a busy/hidden owner window from being mistaken
+ * for a dead owner and having another window kill its nginx/php-cgi workers.
+ */
+const RUNTIME_LOCK_PID_ALIVE_GRACE_MS = 10 * 60_000;
 
 class SiteStartCancelledError extends Error {
   constructor(siteId: string) {
@@ -523,10 +529,15 @@ export class SiteManager {
             return;
           }
 
-          Logger.log(`[SiteManager] startSite found reachable but unowned server for "${site.name}" — killing before fresh start`);
-          onProgress?.('Обнаружены зависшие процессы сайта, очищаю...');
-          await this.cleanupOrphanedSite(site);
+          Logger.log(`[SiteManager] startSite found reachable but unowned server for "${site.name}" — adopting existing server`);
+          onProgress?.('Обнаружен уже запущенный сервер сайта, подключаюсь...');
+          this.writeRuntimeLock(siteId);
+          await this.exposeExternalRunningSite(site, onProgress, true);
           this.throwIfStartCancelled(siteId, startVersion);
+          if (site.status !== 'running') {
+            this.updateStatus(siteId, 'running');
+          }
+          return;
         }
 
         const startOwnerLive = this.isRuntimeLockLive(this.storage.getRuntimeLock(siteId));
@@ -1493,11 +1504,16 @@ export class SiteManager {
     }
   }
 
-  /** A lock proves live ownership only if its owner is alive and its heartbeat is fresh. */
+  /** A lock proves live ownership if its owner is alive and the lock is not ancient. */
   private isRuntimeLockLive(lock: SiteRuntimeLock | undefined): boolean {
     if (!lock) {return false;}
-    if (Date.now() - lock.heartbeatAt > RUNTIME_LOCK_FRESH_MS) {return false;}
+    const age = Date.now() - lock.heartbeatAt;
+    if (age > RUNTIME_LOCK_PID_ALIVE_GRACE_MS) {return false;}
     return this.isPidAlive(lock.ownerPid);
+  }
+
+  private isRuntimeLockOwnedByThisInstance(lock: SiteRuntimeLock | undefined): boolean {
+    return Boolean(lock && lock.ownerPid === this.instancePid);
   }
 
   /** Claim/refresh ownership of a running site for this window. */
@@ -1509,15 +1525,16 @@ export class SiteManager {
     this.storage.clearRuntimeLock(siteId);
   }
 
-  /** Tear down an orphaned web server that survived a window reload. */
-  private async cleanupOrphanedSite(site: WPSite): Promise<void> {
-    try {
-      await this.processes.stopSite(site);
-    } catch (err) {
-      Logger.error(`[SiteManager] failed to stop orphaned server for "${site.name}"`, err);
+  /**
+   * Only clear locks owned by this window, or locks whose owner is definitely
+   * gone. A non-owner status probe must not erase another live window's lock.
+   */
+  private clearRuntimeLockIfOwnedOrDead(siteId: string): void {
+    const lock = this.storage.getRuntimeLock(siteId);
+    if (!lock) {return;}
+    if (this.isRuntimeLockOwnedByThisInstance(lock) || !this.isRuntimeLockLive(lock)) {
+      this.clearRuntimeLock(siteId);
     }
-    this.proxyRouter?.unregister(site);
-    if (site.domain) {this.proxyRouter?.unregisterSni(site.domain);}
   }
 
   private async syncRunningSitesInternal(): Promise<void> {
@@ -1529,50 +1546,80 @@ export class SiteManager {
       const running = this.processes.isSiteRunning(id);
 
       if (!running) {
-        this.syncProbeFailures.delete(id);
         if (site.status === 'running') {
           const probe = await this.checkSiteReachability(site, 1_500);
+          const lock = this.storage.getRuntimeLock(id);
+          const lockLive = this.isRuntimeLockLive(lock);
           if (probe.ready) {
-            if (this.isRuntimeLockLive(this.storage.getRuntimeLock(id))) {
+            this.syncProbeFailures.delete(id);
+            if (lockLive) {
               // Owned by a live VS Code window. Keep the shared running status
               // without attempting local auto-recovery.
+              if (this.isRuntimeLockOwnedByThisInstance(lock)) {
+                this.writeRuntimeLock(id);
+              }
               await this.exposeExternalRunningSite(site);
               continue;
             }
-            // Port answers but nobody owns it — an orphaned web server that
-            // survived a window reload. Kill it and report the real state.
+            // Port answers but nobody owns it. Do not kill it from a background
+            // sync pass: another window can still have a stale heartbeat, and
+            // killing here leaves its proxy route pointing at a dead upstream.
+            // Instead adopt the reachable server; explicit Stop/Restart still
+            // uses command-line cleanup and can tear it down safely.
             Logger.log(
-              `[SiteManager] "${site.name}" reachable but unowned (stale lock) — cleaning up orphaned server`
+              `[SiteManager] "${site.name}" reachable but unowned (stale lock) — adopting external server`
             );
-            await this.cleanupOrphanedSite(site);
-            this.updateStatus(id, 'stopped');
+            this.writeRuntimeLock(id);
+            await this.exposeExternalRunningSite(site);
+            continue;
+          }
+
+          if (lockLive && !this.isRuntimeLockOwnedByThisInstance(lock)) {
+            Logger.log(
+              `[SiteManager] "${site.name}" probe missed from this window${probe.error ? ` (${probe.error})` : ''}, but live owner PID ${lock?.ownerPid} is present — keeping running`
+            );
+            continue;
+          }
+
+          const failures = (this.syncProbeFailures.get(id) ?? 0) + 1;
+          this.syncProbeFailures.set(id, failures);
+          if (failures < SITE_PROBE_FAILURES_BEFORE_RECOVERY) {
+            Logger.log(
+              `[SiteManager] external probe miss #${failures} for "${site.name}"${probe.error ? ` (${probe.error})` : ''} — keeping running`
+            );
             continue;
           }
 
           if (!this.intentionalStops.has(id)) {
             Logger.log(
-              `[SiteManager] "${site.name}" marked running but no local/external server was found — marking stopped`
+              `[SiteManager] "${site.name}" marked running but no local/external server was found after ${failures} probes — marking stopped`
             );
           }
+          this.clearRuntimeLockIfOwnedOrDead(id);
           this.updateStatus(id, 'stopped');
           continue;
         }
         if (site.status === 'starting') {
           const probe = await this.checkSiteReachability(site, 1_500);
-          const startOwnerLive = this.isRuntimeLockLive(this.storage.getRuntimeLock(id));
-          if (probe.ready && startOwnerLive) {
+          const lock = this.storage.getRuntimeLock(id);
+          const startOwnerLive = this.isRuntimeLockLive(lock);
+          if (probe.ready) {
+            this.syncProbeFailures.delete(id);
+            if (!startOwnerLive) {
+              Logger.log(`[SiteManager] "${site.name}" is starting/reachable but unowned — adopting external server`);
+              this.writeRuntimeLock(id);
+            } else if (this.isRuntimeLockOwnedByThisInstance(lock)) {
+              this.writeRuntimeLock(id);
+            }
             await this.exposeExternalRunningSite(site);
             this.updateStatus(id, 'running');
           } else if (!startOwnerLive) {
-            if (probe.ready) {
-              Logger.log(`[SiteManager] "${site.name}" is starting/reachable but unowned — cleaning up orphaned server`);
-              await this.cleanupOrphanedSite(site);
-            } else {
-              Logger.log(`[SiteManager] unowned starting status for "${site.name}" — marking stopped`);
-            }
+            Logger.log(`[SiteManager] unowned starting status for "${site.name}" — marking stopped`);
+            this.clearRuntimeLockIfOwnedOrDead(id);
             this.updateStatus(id, 'stopped');
           } else if (this.isStartingStatusStale(site)) {
             Logger.log(`[SiteManager] stale starting status for "${site.name}" — marking stopped`);
+            this.clearRuntimeLockIfOwnedOrDead(id);
             this.updateStatus(id, 'stopped');
           }
           continue;
@@ -1587,13 +1634,14 @@ export class SiteManager {
         continue;
       }
 
+      // This window owns a live child process. Refresh the lock before the
+      // potentially slow health probe so a few missed/slow probes cannot make
+      // another window classify the server as orphaned and kill it.
+      this.writeRuntimeLock(id);
       const probe = await this.checkSiteReachability(site, 4_000);
 
       if (probe.ready) {
         this.syncProbeFailures.delete(id);
-        // This window owns the live process — keep the shared lock fresh so other
-        // windows can tell this is a real owner and not an orphan.
-        this.writeRuntimeLock(id);
         if (site.status !== 'running') {
           Logger.log(`[SiteManager] sync status for "${site.name}": ${site.status} -> running`);
           this.updateStatus(id, 'running');
@@ -2466,7 +2514,7 @@ export class SiteManager {
     // A site that is no longer running must not keep an ownership lock around,
     // or another window would treat the dead/orphaned server as live.
     if (status === 'stopped' || status === 'error') {
-      this.clearRuntimeLock(siteId);
+      this.clearRuntimeLockIfOwnedOrDead(siteId);
     }
     site.status = status;
     site.statusUpdatedAt = new Date().toISOString();

@@ -39,6 +39,8 @@ export interface RemoteSite {
   adminUrl: string;
   username: string;
   appPassword: string;
+  fileTransferMode?: 'agent' | 'ftp';
+  ftp?: RemoteFtpConfig;
   agentInstalled: boolean;
   /** Live version reported by the agent on the server (kept fresh on every check/update). */
   agentVersion?: string;
@@ -56,6 +58,14 @@ export interface RemoteSite {
   lastSyncMessage?: string;
   syncHistory?: RemoteSyncEvent[];
   createdAt: string;
+}
+
+export interface RemoteFtpConfig {
+  host: string;
+  port?: number;
+  username: string;
+  rootPath: string;
+  secure?: boolean;
 }
 
 export interface RemoteSyncEvent {

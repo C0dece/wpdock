@@ -75,18 +75,25 @@ export class ProxyRouterService {
     if (this.started) {return;}
     this.started = true;
 
-    // 1. Try port 80 directly (works when VS Code is run as administrator).
-    //    In this mode we also serve HTTPS on :443 directly — no portproxy is
-    //    needed (or even possible, since :80/:443 are already bound here).
-    try {
-      await this.bindHttpPort(80, '0.0.0.0');
-      this._port = 80;
-      this._httpsPort = PORTPROXY_HTTPS_PORT; // 443 — HTTPS server starts lazily on registerSni
-      this._directBind = true;
-      Logger.log('[ProxyRouter] bound to port 80 (admin mode) — direct bind, portproxy skipped');
-      this.activatePortlessUrls();
-      return;
-    } catch { /* not admin — continue */ }
+    // 1. Try binding :80 + :443 directly (works when VS Code runs elevated AND
+    //    nothing else owns those ports). HTTPS direct-bind is only viable when :443
+    //    is actually bindable: on many Windows boxes http.sys/SSTP (RAS) permanently
+    //    holds :443, so a raw socket bind there fails with EACCES. If we entered
+    //    direct mode anyway we'd set _httpsPort=443 and the lazy registerSni bind
+    //    would throw EACCES — silently killing HTTPS and marking sites stopped.
+    //    So only take this path when :443 is genuinely free; otherwise fall through
+    //    to the portproxy path (portproxy coexists with http.sys and forwards :443).
+    if (await this.isPortFree(PORTPROXY_HTTPS_PORT)) {
+      try {
+        await this.bindHttpPort(80, '0.0.0.0');
+        this._port = 80;
+        this._httpsPort = PORTPROXY_HTTPS_PORT; // 443 — HTTPS server starts lazily on registerSni
+        this._directBind = true;
+        Logger.log('[ProxyRouter] bound to ports 80+443 directly (admin mode) — portproxy skipped');
+        this.activatePortlessUrls();
+        return;
+      } catch { /* :80 busy / not admin — continue */ }
+    }
 
     // 2. Check existing portproxy rules.
     const targets = os.platform() === 'win32'

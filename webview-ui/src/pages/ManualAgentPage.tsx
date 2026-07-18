@@ -35,6 +35,7 @@ export default function ManualAgentPage({ remoteId, remotes, diagnostic, navigat
   const [diagnosingToken, setDiagnosingToken] = useState(false);
   const [installing, setInstalling] = useState(false);
   const [updating, setUpdating] = useState(false);
+  const [cleaningUploads, setCleaningUploads] = useState(false);
   const [lastStatus, setLastStatus] = useState<{ installed: boolean; active: boolean; responsive: boolean } | null>(null);
   const [installDiagnostic, setInstallDiagnostic] = useState<AgentInstallDiagnostic | null>(diagnostic ?? null);
   const [tokenDiagnostic, setTokenDiagnostic] = useState<RemoteTokenDiagnostic | null>(null);
@@ -82,11 +83,15 @@ export default function ManualAgentPage({ remoteId, remotes, diagnostic, navigat
         setUpdating(false);
         setInstallDiagnostic(msg.diagnostic ?? null);
       }
+      if (msg.type === 'remoteUploadResidueCleaned' && msg.remoteId === remoteId) {
+        setCleaningUploads(false);
+      }
       if (msg.type === 'error') {
         setChecking(false);
         setDiagnosingToken(false);
         setInstalling(false);
         setUpdating(false);
+        setCleaningUploads(false);
       }
     };
     window.addEventListener('message', handler);
@@ -139,6 +144,20 @@ export default function ManualAgentPage({ remoteId, remotes, diagnostic, navigat
             </div>
             <button className="btn btn-primary btn-sm" onClick={() => { setUpdating(true); vscode.postMessage({ type: 'updateAgent', payload: { remoteId } }); }} disabled={updating}>
               {updating ? 'Обновление...' : 'Обновить WP Agent'}
+            </button>
+          </div>
+        </div>
+      )}
+
+      {remote.agentInstalled && (
+        <div className="card">
+          <div className="toolbar-wrap" style={{ justifyContent: 'space-between', alignItems: 'flex-start' }}>
+            <div>
+              <div className="mini-item-title">Очистка остатков Push</div>
+              <div className="section-copy">Удалит незавершённые resumable chunks и временные ZIP/SQL на сервере, если вы передумали продолжать прерванную загрузку.</div>
+            </div>
+            <button className="btn btn-danger btn-sm" onClick={() => { setCleaningUploads(true); vscode.postMessage({ type: 'cleanupRemoteUploads', payload: { remoteId } }); }} disabled={cleaningUploads}>
+              {cleaningUploads ? 'Очистка...' : 'Очистить остатки'}
             </button>
           </div>
         </div>

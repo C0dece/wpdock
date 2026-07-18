@@ -12,6 +12,7 @@ interface PluginSettings {
   defaultPhpVersion: string;
   directUploadLimitMb: number;
   chunkSizeMb: number;
+  uploadConcurrency: number;
   autoBackup: boolean;
   backupIntervalHours: number;
   backupKeepCount: number;
@@ -31,6 +32,7 @@ const DEFAULTS: PluginSettings = {
   defaultPhpVersion: '8.2',
   directUploadLimitMb: 1,
   chunkSizeMb: 0.75,
+  uploadConcurrency: 8,
   autoBackup: false,
   backupIntervalHours: 24,
   backupKeepCount: 5,
@@ -125,8 +127,12 @@ export default function SettingsPage({ navigate, onToast }: Props) {
                   <label className="form-label">Размер чанка, МБ</label>
                   <input className="form-input" type="number" min={0.25} max={32} step={0.25} value={settings.chunkSizeMb} onChange={(e) => set('chunkSizeMb', Number(e.target.value))} />
                 </div>
+                <div className="form-group">
+                  <label className="form-label">Параллельные чанки</label>
+                  <input className="form-input" type="number" min={1} max={16} step={1} value={settings.uploadConcurrency} onChange={(e) => set('uploadConcurrency', Number(e.target.value))} />
+                </div>
               </div>
-              <span className="form-hint">Уменьшайте размер чанка при 413/timeout, увеличивайте для скорости.</span>
+              <span className="form-hint">При ошибках 413/timeout/квоты уменьшайте размер чанка и параллелизм. Для слабого shared-хостинга обычно достаточно 1–3 потока.</span>
             </section>
 
             <section className="card">

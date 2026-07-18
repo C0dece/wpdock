@@ -20,6 +20,13 @@ export default function ConnectRemotePage({ navigate, onToast, siteId, sites }: 
     url: '',
     username: '',
     appPassword: '',
+    fileTransferMode: 'agent' as 'agent' | 'ftp',
+    ftpHost: '',
+    ftpPort: '21',
+    ftpUsername: '',
+    ftpPassword: '',
+    ftpRootPath: '/public_html',
+    ftpSecure: false,
     autoInstallAgent: true,
     preferCreateSiteOnPull: !isSiteContext,
     defaultLocalSiteName: selectedSite?.name ?? '',
@@ -70,12 +77,26 @@ export default function ConnectRemotePage({ navigate, onToast, siteId, sites }: 
     e.preventDefault();
     const normalizedUrl = normalizeRemoteUrlInput(form.url);
     if (!normalizedUrl.startsWith('http')) return onToast('Введите корректный URL WordPress', 'error');
-    if (!form.username || !form.appPassword) return onToast('Укажите логин администратора и Application Password', 'error');
+    if (form.fileTransferMode === 'agent' && (!form.username || !form.appPassword)) {
+      return onToast('Для передачи через агент укажите логин администратора и Application Password', 'error');
+    }
+    if (form.fileTransferMode === 'ftp' && (!form.ftpHost || !form.ftpUsername || !form.ftpPassword || !form.ftpRootPath)) {
+      return onToast('Укажите FTP host, логин, пароль и корневую папку WordPress', 'error');
+    }
 
     const payload = {
       ...form,
       url: normalizedUrl,
       name: form.name || deriveNameFromUrl(normalizedUrl),
+      autoInstallAgent: form.fileTransferMode === 'agent' ? form.autoInstallAgent : false,
+      ftp: form.fileTransferMode === 'ftp' ? {
+        host: form.ftpHost.trim(),
+        port: Number(form.ftpPort || 21),
+        username: form.ftpUsername.trim(),
+        password: form.ftpPassword,
+        rootPath: form.ftpRootPath.trim() || '/',
+        secure: form.ftpSecure,
+      } : undefined,
       preferCreateSiteOnPull: isSiteContext ? false : form.preferCreateSiteOnPull,
       defaultLocalSiteName: isSiteContext ? selectedSite?.name || deriveNameFromUrl(normalizedUrl) : (form.defaultLocalSiteName || deriveNameFromUrl(normalizedUrl)),
       defaultPhpVersion: isSiteContext ? selectedSite?.phpVersion || form.defaultPhpVersion : form.defaultPhpVersion,
@@ -113,7 +134,7 @@ export default function ConnectRemotePage({ navigate, onToast, siteId, sites }: 
         <div className="site-card-meta-row">
           <span className="badge badge-green">remote</span>
           <span className="site-card-chip">{previewName}</span>
-          <span className="site-card-chip">{form.autoInstallAgent ? 'auto-agent' : 'manual-agent'}</span>
+          <span className="site-card-chip">{form.fileTransferMode === 'ftp' ? 'ftp' : (form.autoInstallAgent ? 'auto-agent' : 'manual-agent')}</span>
           {selectedSite && <span className="site-card-chip">{selectedSite.name}</span>}
         </div>
         <div className="detail-summary-grid">
@@ -123,7 +144,7 @@ export default function ConnectRemotePage({ navigate, onToast, siteId, sites }: 
           <div className="overview-stat"><span className="overview-stat-value">{form.defaultSsl ? 'https' : 'http'}</span><span className="overview-stat-label">default</span></div>
         </div>
         <div className="section-copy">
-          Подключитесь к WordPress через Application Password.
+          Подключитесь к WordPress через Application Password или настройте FTP для передачи файлов без агента.
           {selectedSite && <> Remote будет связан с локальным сайтом <strong style={{ color: 'var(--fg)' }}>{selectedSite.name}</strong>.</>}
         </div>
         <div className="section-copy">
@@ -177,12 +198,48 @@ export default function ConnectRemotePage({ navigate, onToast, siteId, sites }: 
               <input className="input" type="password" placeholder="xxxx xxxx xxxx xxxx" value={form.appPassword} onChange={set('appPassword')} />
             </div>
           </div>
+          <div className="form-hint">WP-доступ нужен только для режима агента. В FTP-режиме файлы идут по FTP, а БД — через временный PHP bridge в корне WordPress.</div>
         </div>
 
         <div className="stack-sm">
           <div className="card">
-            <div className="card-header"><span className="card-title">Дополнительные настройки</span></div>
-            <label className="checkbox-row"><input type="checkbox" checked={form.autoInstallAgent} onChange={toggle('autoInstallAgent')} /> Сразу установить WPDock Agent</label>
+            <div className="card-header"><span className="card-title">Способ передачи файлов</span></div>
+            <div className="toolbar-wrap" style={{ marginBottom: 10 }}>
+              <button type="button" className={`btn btn-sm ${form.fileTransferMode === 'agent' ? 'btn-primary' : 'btn-secondary'}`} onClick={() => setForm((prev) => ({ ...prev, fileTransferMode: 'agent' }))}>WPDock Agent</button>
+              <button type="button" className={`btn btn-sm ${form.fileTransferMode === 'ftp' ? 'btn-primary' : 'btn-secondary'}`} onClick={() => setForm((prev) => ({ ...prev, fileTransferMode: 'ftp', autoInstallAgent: false }))}>FTP / FTPS</button>
+            </div>
+            {form.fileTransferMode === 'agent' ? (
+              <label className="checkbox-row"><input type="checkbox" checked={form.autoInstallAgent} onChange={toggle('autoInstallAgent')} /> Сразу установить WPDock Agent</label>
+            ) : (
+              <div className="stack-sm">
+                <div className="form-row">
+                  <div className="form-group">
+                    <label className="form-label">FTP host</label>
+                    <input className="input" placeholder="ftp.example.com" value={form.ftpHost} onChange={set('ftpHost')} />
+                  </div>
+                  <div className="form-group">
+                    <label className="form-label">Порт</label>
+                    <input className="input" placeholder="21" value={form.ftpPort} onChange={set('ftpPort')} />
+                  </div>
+                </div>
+                <div className="form-row">
+                  <div className="form-group">
+                    <label className="form-label">FTP логин</label>
+                    <input className="input" value={form.ftpUsername} onChange={set('ftpUsername')} />
+                  </div>
+                  <div className="form-group">
+                    <label className="form-label">FTP пароль</label>
+                    <input className="input" type="password" value={form.ftpPassword} onChange={set('ftpPassword')} />
+                  </div>
+                </div>
+                <div className="form-group">
+                  <label className="form-label">Папка WordPress на FTP</label>
+                  <input className="input" placeholder="/public_html" value={form.ftpRootPath} onChange={set('ftpRootPath')} />
+                  <div className="form-hint">Укажите корень WordPress (wp-content/wp-admin/wp-load.php). Для БД WPDock временно загрузит сюда одноразовый DB bridge.</div>
+                </div>
+                <label className="checkbox-row"><input type="checkbox" checked={form.ftpSecure} onChange={toggle('ftpSecure')} /> Использовать FTPS (TLS)</label>
+              </div>
+            )}
           </div>
 
           {!isSiteContext && (

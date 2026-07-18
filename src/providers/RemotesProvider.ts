@@ -30,7 +30,7 @@ export class RemoteTreeItem extends vscode.TreeItem {
     this.remoteId = remote.id;
     this.contextValue = 'remote-site';
     this.description = new URL(remote.url).hostname;
-    this.tooltip = `${remote.name}\n${remote.url}\nАгент: ${remote.agentInstalled ? 'установлен' : 'не установлен'}`;
+    this.tooltip = `${remote.name}\n${remote.url}\nПередача: ${remote.fileTransferMode === 'ftp' ? 'FTP' : 'WPDock Agent'}\nАгент: ${remote.agentInstalled ? 'установлен' : 'не установлен'}`;
     this.iconPath = new vscode.ThemeIcon('cloud');
   }
 }

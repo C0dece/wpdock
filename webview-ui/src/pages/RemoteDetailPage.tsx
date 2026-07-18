@@ -20,6 +20,7 @@ export default function RemoteDetailPage({ remoteId, remotes, sites, navigate, o
   const [selectedSiteId, setSelectedSiteId] = useState('');
   const [historyExpanded, setHistoryExpanded] = useState(false);
   const [resetting, setResetting] = useState(false);
+  const [cleaningUploads, setCleaningUploads] = useState(false);
   const [openSections, setOpenSections] = useState<Record<SectionKey, boolean>>({
     overview: true,
     links: true,
@@ -36,7 +37,13 @@ export default function RemoteDetailPage({ remoteId, remotes, sites, navigate, o
         setResetting(false);
         onToast('WordPress сброшен до заводских настроек', 'success');
       }
-      if (msg.type === 'error') setResetting(false);
+      if (msg.type === 'remoteUploadResidueCleaned' && msg.remoteId === remoteId) {
+        setCleaningUploads(false);
+      }
+      if (msg.type === 'error') {
+        setResetting(false);
+        setCleaningUploads(false);
+      }
     };
     window.addEventListener('message', handler);
     return () => window.removeEventListener('message', handler);
@@ -67,8 +74,8 @@ export default function RemoteDetailPage({ remoteId, remotes, sites, navigate, o
 
       <div className="detail-hero card">
         <div className="site-card-meta-row">
-          <span className={`badge ${remote.agentInstalled ? 'badge-green' : 'badge-yellow'}`}>
-            {remote.agentInstalled ? 'agent ok' : 'agent missing'}
+          <span className={`badge ${remote.fileTransferMode === 'ftp' || remote.agentInstalled ? 'badge-green' : 'badge-yellow'}`}>
+            {remote.fileTransferMode === 'ftp' ? 'ftp' : (remote.agentInstalled ? 'agent ok' : 'agent missing')}
           </span>
           {remote.agentVersion && <span className="site-card-chip">v{remote.agentVersion}</span>}
           <span className="site-card-chip">{remote.username}</span>
@@ -79,21 +86,33 @@ export default function RemoteDetailPage({ remoteId, remotes, sites, navigate, o
           <div className="overview-stat"><span className="overview-stat-value">{linkedSites.length}</span><span className="overview-stat-label">linked</span></div>
           <div className="overview-stat"><span className="overview-stat-value">{syncHistory.length}</span><span className="overview-stat-label">syncs</span></div>
           <div className="overview-stat"><span className="overview-stat-value">{remote.lastSyncStatus ?? '—'}</span><span className="overview-stat-label">last status</span></div>
-          <div className="overview-stat"><span className="overview-stat-value">{remote.agentInstalled ? 'yes' : 'no'}</span><span className="overview-stat-label">agent</span></div>
+          <div className="overview-stat"><span className="overview-stat-value">{remote.fileTransferMode === 'ftp' ? 'ftp' : (remote.agentInstalled ? 'yes' : 'no')}</span><span className="overview-stat-label">transfer</span></div>
         </div>
         <div className="action-cluster">
           <button className="btn btn-secondary" onClick={() => navigate({ name: 'sync', remoteId, direction: 'pull', localSiteId: primaryLinkedSite?.id, quickPull: Boolean(primaryLinkedSite?.id) })}>↓ Pull</button>
           <button className="btn btn-secondary" onClick={() => navigate({ name: 'sync', remoteId, direction: 'push', localSiteId: primaryLinkedSite?.id })}>↑ Push</button>
           <button className="btn btn-secondary" onClick={() => navigate({ name: 'edit-remote', remoteId })}>✏ Редактировать</button>
-          <button className="btn btn-secondary" onClick={() => navigate({ name: 'manual-agent', remoteId })}>🧩 Агент</button>
-          <button
-            className="btn btn-danger"
-            disabled={resetting}
-            title="Сбросить WordPress до заводских: удалит БД, плагины, темы и uploads (админ, пароль, агент и одна тема сохранятся)"
-            onClick={() => { setResetting(true); vscode.postMessage({ type: 'resetRemoteWp', payload: { remoteId } }); }}
-          >
-            {resetting ? '♻ Сброс...' : '♻ Сбросить WP'}
-          </button>
+          {remote.fileTransferMode !== 'ftp' && <button className="btn btn-secondary" onClick={() => navigate({ name: 'manual-agent', remoteId })}>🧩 Агент</button>}
+          {remote.fileTransferMode !== 'ftp' && (
+            <button
+              className="btn btn-danger"
+              disabled={cleaningUploads}
+              title="Удалить незавершённые chunks и временные ZIP/SQL после прерванного Push"
+              onClick={() => { setCleaningUploads(true); vscode.postMessage({ type: 'cleanupRemoteUploads', payload: { remoteId } }); }}
+            >
+              {cleaningUploads ? '🧹 Очистка...' : '🧹 Остатки Push'}
+            </button>
+          )}
+          {remote.fileTransferMode !== 'ftp' && (
+            <button
+              className="btn btn-danger"
+              disabled={resetting}
+              title="Сбросить WordPress до заводских: удалит БД, плагины, темы и uploads (админ, пароль, агент и одна тема сохранятся)"
+              onClick={() => { setResetting(true); vscode.postMessage({ type: 'resetRemoteWp', payload: { remoteId } }); }}
+            >
+              {resetting ? '♻ Сброс...' : '♻ Сбросить WP'}
+            </button>
+          )}
           <button className="btn btn-danger" onClick={() => vscode.postMessage({ type: 'removeRemote', payload: { remoteId } })}>🗑 Удалить</button>
         </div>
       </div>
@@ -104,6 +123,7 @@ export default function RemoteDetailPage({ remoteId, remotes, sites, navigate, o
             <div className="card-header"><span className="card-title">Информация</span></div>
             <div className="detail-info-row"><span className="detail-info-label">URL</span><span className="detail-info-value">{remote.url}</span></div>
             <div className="detail-info-row"><span className="detail-info-label">Логин</span><span className="detail-info-value">{remote.username}</span></div>
+            <div className="detail-info-row"><span className="detail-info-label">Передача файлов</span><span className="detail-info-value">{remote.fileTransferMode === 'ftp' ? `FTP · ${remote.ftp?.host ?? ''}${remote.ftp?.rootPath ? `:${remote.ftp.rootPath}` : ''}` : 'WPDock Agent'}</span></div>
             <div className="detail-info-row"><span className="detail-info-label">Агент</span><span className="detail-info-value">{remote.agentInstalled ? `установлен${remote.agentVersion ? ` · v${remote.agentVersion}` : ''}` : 'не подтверждён'}</span></div>
             <div className="detail-info-row"><span className="detail-info-label">Связанные сайты</span><span className="detail-info-value">{linkedSites.length > 0 ? linkedSites.map((site) => site.name).join(', ') : 'нет'}</span></div>
             <div className="detail-info-row"><span className="detail-info-label">Последний sync</span><span className="detail-info-value">{remote.lastSyncAt ? new Date(remote.lastSyncAt).toLocaleString('ru-RU') : '—'}</span></div>
@@ -115,7 +135,12 @@ export default function RemoteDetailPage({ remoteId, remotes, sites, navigate, o
               <button className="btn btn-secondary btn-sm" onClick={() => navigate({ name: 'sync', remoteId, direction: 'pull', localSiteId: primaryLinkedSite?.id, quickPull: Boolean(primaryLinkedSite?.id) })}>Pull</button>
               <button className="btn btn-secondary btn-sm" onClick={() => navigate({ name: 'sync', remoteId, direction: 'push', localSiteId: primaryLinkedSite?.id })}>Push</button>
               <button className="btn btn-secondary btn-sm" onClick={() => navigate({ name: 'edit-remote', remoteId })}>Редактировать</button>
-              <button className="btn btn-secondary btn-sm" onClick={() => navigate({ name: 'manual-agent', remoteId })}>Агент</button>
+              {remote.fileTransferMode !== 'ftp' && <button className="btn btn-secondary btn-sm" onClick={() => navigate({ name: 'manual-agent', remoteId })}>Агент</button>}
+              {remote.fileTransferMode !== 'ftp' && (
+                <button className="btn btn-danger btn-sm" disabled={cleaningUploads} onClick={() => { setCleaningUploads(true); vscode.postMessage({ type: 'cleanupRemoteUploads', payload: { remoteId } }); }}>
+                  {cleaningUploads ? 'Очистка...' : 'Очистить остатки Push'}
+                </button>
+              )}
             </div>
           </div>
         </div>
@@ -188,7 +213,7 @@ export default function RemoteDetailPage({ remoteId, remotes, sites, navigate, o
         <button className="btn btn-secondary btn-sm" onClick={() => navigate({ name: 'sync', remoteId, direction: 'pull', localSiteId: primaryLinkedSite?.id, quickPull: Boolean(primaryLinkedSite?.id) })}>↓ Pull</button>
         <button className="btn btn-secondary btn-sm" onClick={() => navigate({ name: 'sync', remoteId, direction: 'push', localSiteId: primaryLinkedSite?.id })}>↑ Push</button>
         <button className="btn btn-secondary btn-sm" onClick={() => navigate({ name: 'edit-remote', remoteId })}>✏ Edit</button>
-        <button className="btn btn-secondary btn-sm" onClick={() => navigate({ name: 'manual-agent', remoteId })}>🧩 Agent</button>
+        {remote.fileTransferMode !== 'ftp' && <button className="btn btn-secondary btn-sm" onClick={() => navigate({ name: 'manual-agent', remoteId })}>🧩 Agent</button>}
       </div>
     </div>
   );

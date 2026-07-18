@@ -3,13 +3,19 @@ import * as path from 'path';
 import * as fs from 'fs';
 import * as os from 'os';
 import * as cp from 'child_process';
+import * as crypto from 'crypto';
 import { Readable, Transform } from 'stream';
-import { RemoteSite, RemoteSyncEvent } from '../types';
+import { RemoteFtpConfig, RemoteSite, RemoteSyncEvent } from '../types';
 import { StorageService } from './StorageService';
 import { Logger } from '../utils/logger';
 
 const AGENT_PLUGIN_BASENAME = 'wpdock-agent/wpdock-agent.php';
 const MIN_AGENT_VERSION = '1.3.0';
+// Fatal server-side condition reported by ping (agent ≥1.3.17): wpdock-temp is
+// not writable (disk full / hosting quota exceeded). Must escape ensureAgent's
+// fallback chain — reinstalling the agent cannot fix the disk, and continuing
+// means the push fails only after minutes of local packing.
+class AgentTempUnwritableError extends Error {}
 // First agent version with the `list_files` action — the prerequisite for the
 // direct (PHP-bypassing) resumable media download. Below this we fall back to
 // packing uploads through the agent like any other file.
@@ -18,6 +24,8 @@ const MEDIA_DIRECT_AGENT_VERSION = '1.3.6';
 // themes, uploads) while preserving the admin user, its Application Passwords,
 // one default theme and the WPDock agent itself. 1.3.8 reset DB only.
 const RESET_WP_AGENT_VERSION = '1.3.9';
+// Agent with single-file incremental manifest/download/delete actions.
+const INCREMENTAL_AGENT_VERSION = '1.3.13';
 let DIRECT_UPLOAD_MAX_BYTES = 1024 * 1024;
 // Configurable chunk size for uploads (default 768KB, increase for better hosts)
 // Use 1-2 MB for hosts with higher limits (300MB+)
@@ -28,9 +36,17 @@ let CHUNK_UPLOAD_BYTES = 768 * 1024;
 // better than bigger chunks. Configurable via wpdock.remoteUpload.concurrency;
 // kept modest so a tiny shared-host PHP worker pool isn't exhausted.
 let CHUNK_UPLOAD_CONCURRENCY = 8;
+// During one Push we can temporarily cap concurrency below the user setting when
+// the host starts returning transient TLS/socket/idle errors. This keeps a huge
+// split-push moving instead of retrying every next ZIP part with the same pressure.
+const MIN_ADAPTIVE_UPLOAD_CONCURRENCY = 1;
 // Smallest chunk we will fall back to when a host rejects an oversized body (413).
 const MIN_CHUNK_UPLOAD_BYTES = 256 * 1024;
 const UPLOAD_RETRY_COUNT = 3;
+// How many times a chunked-upload session is re-opened after a transient failure.
+// Agent ≥1.3.12 resumes by resume_key and skips chunks already stored remotely.
+const UPLOAD_SESSION_RETRY_COUNT = 3;
+type AgentUploadWriteMode = 'single_file' | 'chunks';
 const UPLOAD_RETRY_DELAY_MS = 1000;
 // Upload abort is driven by an *idle* timer (no bytes sent), not a fixed total
 // timeout — so genuinely slow-but-working uploads to remote hosts are not killed.
@@ -59,6 +75,10 @@ const MEDIA_DOWNLOAD_SAMPLE_MS = 2 * 1000;
 const PART_DOWNLOAD_RETRY_COUNT = 3;
 // Default timeout for short agent JSON requests (ping, register, status, …).
 const AGENT_REQUEST_TIMEOUT_MS = 60 * 1000;
+// Upload control-plane requests (upload_init/finalize/abort) are tiny JSON calls,
+// but shared hosts can leave them queued behind slow chunk workers. Give them more
+// time than ordinary ping/status so a large split-push does not die between parts.
+const AGENT_UPLOAD_CONTROL_TIMEOUT_MS = 5 * 60 * 1000;
 // Heavy server-side agent ops (pack_files, export_db, extract_files, import_db)
 // block on the remote with NO byte progress while WordPress zips/dumps/imports,
 // so the upload idle-timer doesn't apply — give them a generous absolute cap
@@ -82,6 +102,13 @@ const UPLOAD_PROGRESS_LOG_INTERVAL_MS = 5 * 1000;
 // ZIP compression: 1 = fastest (store+minimal), 6 = balance (default), 9 = slowest
 // For push during dev, speed matters more than size
 const ZIP_COMPRESSION_LEVEL = 1;
+// Very large single ZIP uploads can fail on shared hosting even when
+// disk_free_space() reports plenty of room (account quota/per-file limits,
+// sparse-file writes, ZipArchive limits). Above this estimate, push files as
+// several independent ZIPs and extract each one immediately on the remote.
+const PUSH_SPLIT_THRESHOLD_BYTES = 1536 * 1024 * 1024;
+const PUSH_SPLIT_PART_TARGET_BYTES = 512 * 1024 * 1024;
+const TRANSFER_STATE_TTL_MS = 24 * 60 * 60 * 1000;
 // Files/folders excluded from push (cache, logs, temp, etc.)
 const PUSH_IGNORE_PATTERNS = [
   'node_modules/**',
@@ -91,6 +118,8 @@ const PUSH_IGNORE_PATTERNS = [
   '**/wp-config.php',
   'database.sql',
   '**/database.sql',
+  'wpdock-db-bridge-*.php',
+  'wpdock-db-*.sql',
   '.DS_Store',
   'thumbs.db',
   '**/.DS_Store',
@@ -142,6 +171,8 @@ const PUSH_TAR_EXCLUDES = [
   '*/.gitignore', '.gitignore',
   'wp-config.php', '*/wp-config.php',
   'database.sql', '*/database.sql',
+  'wpdock-db-bridge-*.php',
+  'wpdock-db-*.sql',
   '*.DS_Store', 'Thumbs.db', 'thumbs.db',
   'wp-content/cache/*', 'wp-content/cache',
   'wp-content/upgrade/*',
@@ -188,9 +219,89 @@ export interface RemoteTokenDiagnostic {
   recommendations: string[];
 }
 
+interface PushArchiveEntry {
+  abs: string;
+  rel: string;
+  size: number;
+  mtimeMs: number;
+}
+
+interface PushArchivePart {
+  entries: PushArchiveEntry[];
+  estimatedBytes: number;
+}
+
+interface PushArchivePlan {
+  entries: PushArchiveEntry[];
+  parts: PushArchivePart[];
+  totalBytes: number;
+}
+
+interface FileManifestEntry {
+  rel: string;
+  size: number;
+  mtimeMs: number;
+}
+
+interface HostingSyncState {
+  version: 1;
+  remoteId: string;
+  updatedAt: string;
+  local: Record<string, FileManifestEntry>;
+  remote: Record<string, FileManifestEntry>;
+}
+
+interface PullPackStreamState {
+  nextSeq: number;
+  processed: number;
+  done?: boolean;
+}
+
+interface PullPackTransferState {
+  key: string;
+  jobId: string;
+  total: number;
+  shards: number;
+  agentVersion: string;
+  streams: Record<string, PullPackStreamState>;
+  completed?: boolean;
+  parts?: number;
+  bytes?: number;
+}
+
+interface PushFilesTransferState {
+  planKey: string;
+  mode: 'single' | 'split' | 'ftp';
+  completed?: boolean;
+  completedParts?: number[];
+  completedFiles?: Record<string, FileManifestEntry>;
+}
+
+interface RemoteTransferState {
+  version: 1;
+  remoteId: string;
+  updatedAt: string;
+  pullPack?: PullPackTransferState;
+  pushFiles?: PushFilesTransferState;
+  ftpPull?: PushFilesTransferState;
+}
+
+type FileTransferMode = 'agent' | 'ftp';
+
+interface FtpDbBridgeSession {
+  id: string;
+  secret: string;
+  bridgeName: string;
+  sqlName: string;
+  bridgeUrl: string;
+  remoteBridgePath: string;
+  remoteSqlPath: string;
+}
+
 export class RemoteService {
   private readonly onDidChangeRemotesEmitter = new vscode.EventEmitter<void>();
   readonly onDidChangeRemotes = this.onDidChangeRemotesEmitter.event;
+  private adaptiveUploadConcurrencyLimit: number | undefined;
 
   constructor(
     private context: vscode.ExtensionContext,
@@ -223,6 +334,32 @@ export class RemoteService {
   private normalizeConcurrency(value: number | undefined): number {
     const v = Number.isFinite(value) ? Number(value) : 8;
     return Math.min(16, Math.max(1, Math.round(v)));
+  }
+
+  private resetAdaptiveUploadTuning(): void {
+    this.adaptiveUploadConcurrencyLimit = undefined;
+  }
+
+  private getEffectiveUploadConcurrency(): number {
+    const configured = this.normalizeConcurrency(CHUNK_UPLOAD_CONCURRENCY);
+    const adaptiveLimit = this.adaptiveUploadConcurrencyLimit;
+    if (!Number.isFinite(adaptiveLimit)) {
+      return configured;
+    }
+    return Math.min(configured, this.normalizeConcurrency(adaptiveLimit));
+  }
+
+  private reduceAdaptiveUploadConcurrency(reason: string): void {
+    const current = this.getEffectiveUploadConcurrency();
+    if (current <= MIN_ADAPTIVE_UPLOAD_CONCURRENCY) {return;}
+
+    const next = Math.max(MIN_ADAPTIVE_UPLOAD_CONCURRENCY, Math.ceil(current / 2));
+    if (next >= current) {return;}
+
+    this.adaptiveUploadConcurrencyLimit = next;
+    Logger.log(
+      `[RemoteService] adaptive upload throttling concurrency ${current} -> ${next} reason=${reason}`
+    );
   }
 
   private normalizeUploadSettingBytes(
@@ -285,6 +422,8 @@ export class RemoteService {
       url: string;
       username: string;
       appPassword: string;
+      fileTransferMode?: FileTransferMode;
+      ftp?: RemoteFtpConfig & { password?: string };
       autoInstallAgent?: boolean;
       preferCreateSiteOnPull?: boolean;
       defaultLocalSiteName?: string;
@@ -297,10 +436,24 @@ export class RemoteService {
     const { v4: uuidv4 } = await import('uuid');
     const normalizedUrl = this.normalizeSiteUrl(options.url);
     const normalizedAppPassword = this.normalizeAppPassword(options.appPassword);
+    const ftp = this.normalizeFtpConfig(options.ftp);
+    const fileTransferMode: FileTransferMode = options.fileTransferMode === 'ftp' ? 'ftp' : 'agent';
     const adminUrl = `${normalizedUrl}/wp-admin`;
 
-    // Verify credentials
-    await this.verifyCredentials(normalizedUrl, options.username, normalizedAppPassword);
+    if (!normalizedAppPassword && fileTransferMode !== 'ftp') {
+      throw new Error('Для подключения через агент нужен WordPress Application Password. Для FTP укажите FTP-настройки и выберите FTP как способ передачи файлов.');
+    }
+    if (fileTransferMode === 'ftp') {
+      if (!ftp) { throw new Error('Укажите FTP host, логин и корневую папку WordPress.'); }
+      if (!options.ftp?.password) { throw new Error('Укажите FTP пароль.'); }
+      await this.verifyFtpConnection(ftp, options.ftp.password);
+    }
+
+    // Verify WP credentials only when provided. FTP remotes can sync files without
+    // the agent; DB sync uses a temporary one-shot PHP bridge uploaded via FTP.
+    if (normalizedAppPassword) {
+      await this.verifyCredentials(normalizedUrl, options.username, normalizedAppPassword);
+    }
 
     const remote: RemoteSite = {
       id: uuidv4(),
@@ -309,8 +462,10 @@ export class RemoteService {
       adminUrl,
       username: options.username,
       appPassword: '', // don't store in plain JSON
+      fileTransferMode,
+      ftp,
       agentInstalled: false,
-      autoInstallAgent: options.autoInstallAgent ?? true,
+      autoInstallAgent: normalizedAppPassword ? (options.autoInstallAgent ?? true) : false,
       preferCreateSiteOnPull: options.preferCreateSiteOnPull ?? false,
       defaultLocalSiteName: options.defaultLocalSiteName?.trim() || options.name,
       defaultPhpVersion: options.defaultPhpVersion ?? '8.2',
@@ -322,7 +477,12 @@ export class RemoteService {
     };
 
     // Store app password securely
-    await this.storage.saveSecret(`remote-${remote.id}-pass`, normalizedAppPassword);
+    if (normalizedAppPassword) {
+      await this.storage.saveSecret(`remote-${remote.id}-pass`, normalizedAppPassword);
+    }
+    if (fileTransferMode === 'ftp' && options.ftp?.password) {
+      await this.storage.saveSecret(`remote-${remote.id}-ftp-pass`, options.ftp.password);
+    }
     this.storage.saveRemote(remote);
     return remote;
   }
@@ -365,6 +525,8 @@ export class RemoteService {
       url?: string;
       username?: string;
       appPassword?: string;
+      fileTransferMode?: FileTransferMode;
+      ftp?: (RemoteFtpConfig & { password?: string }) | null;
       autoInstallAgent?: boolean;
       preferCreateSiteOnPull?: boolean;
       defaultLocalSiteName?: string;
@@ -387,14 +549,37 @@ export class RemoteService {
       ? updates.name.trim()
       : remote.name;
     const nextAppPassword = this.normalizeAppPassword(updates.appPassword ?? '');
+    const nextFileTransferMode: FileTransferMode = updates.fileTransferMode === 'ftp'
+      ? 'ftp'
+      : updates.fileTransferMode === 'agent'
+        ? 'agent'
+        : (remote.fileTransferMode === 'ftp' ? 'ftp' : 'agent');
+    const nextFtp = updates.ftp !== undefined
+      ? this.normalizeFtpConfig(updates.ftp ?? undefined)
+      : remote.ftp;
 
     if (!nextName) {throw new Error('Название удаленного сайта не может быть пустым');}
-    if (!nextUsername) {throw new Error('Логин WordPress не может быть пустым');}
+    if (!nextUsername && nextFileTransferMode !== 'ftp') {throw new Error('Логин WordPress не может быть пустым');}
 
     const currentPassword = await this.storage.getSecret(`remote-${remoteId}-pass`);
     const resolvedPassword = nextAppPassword || this.normalizeAppPassword(currentPassword || '');
-    if (!resolvedPassword) {
-      throw new Error('Application Password не найден. Укажите его заново.');
+    if (!resolvedPassword && nextFileTransferMode !== 'ftp') {
+      throw new Error('Application Password не найден. Укажите его заново или выберите FTP для передачи файлов.');
+    }
+
+    if (nextFileTransferMode === 'ftp') {
+      if (!nextFtp) { throw new Error('Укажите FTP host, логин и корневую папку WordPress.'); }
+      const nextFtpPassword = String(updates.ftp?.password ?? '');
+      const storedFtpPassword = await this.storage.getSecret(`remote-${remoteId}-ftp-pass`);
+      const resolvedFtpPassword = nextFtpPassword || storedFtpPassword || '';
+      if (!resolvedFtpPassword) { throw new Error('FTP пароль не найден. Укажите его заново.'); }
+      const ftpChanged = JSON.stringify(nextFtp) !== JSON.stringify(remote.ftp ?? undefined) || nextFtpPassword.length > 0;
+      if (ftpChanged) {
+        await this.verifyFtpConnection(nextFtp, resolvedFtpPassword);
+      }
+      if (nextFtpPassword.length > 0) {
+        await this.storage.saveSecret(`remote-${remoteId}-ftp-pass`, nextFtpPassword);
+      }
     }
 
     const credentialsChanged = (
@@ -403,7 +588,7 @@ export class RemoteService {
       nextAppPassword.length > 0
     );
 
-    if (credentialsChanged) {
+    if (credentialsChanged && resolvedPassword) {
       await this.verifyCredentials(nextUrl, nextUsername, resolvedPassword);
     }
 
@@ -417,6 +602,8 @@ export class RemoteService {
       url: nextUrl,
       adminUrl: `${nextUrl}/wp-admin`,
       username: nextUsername,
+      fileTransferMode: nextFileTransferMode,
+      ftp: nextFileTransferMode === 'ftp' ? nextFtp : remote.ftp,
       autoInstallAgent: updates.autoInstallAgent ?? remote.autoInstallAgent,
       preferCreateSiteOnPull: updates.preferCreateSiteOnPull ?? remote.preferCreateSiteOnPull,
       defaultLocalSiteName: updates.defaultLocalSiteName?.trim() || remote.defaultLocalSiteName,
@@ -623,6 +810,7 @@ export class RemoteService {
 
   async removeRemote(id: string): Promise<void> {
     await this.storage.deleteSecret(`remote-${id}-pass`);
+    await this.storage.deleteSecret(`remote-${id}-ftp-pass`);
     this.storage.removeRemote(id);
   }
 
@@ -677,6 +865,22 @@ export class RemoteService {
     onProgress?.('WordPress сброшен до заводских настроек.');
     Logger.log(`[RemoteService] resetRemoteWp success remote=${remote.name} id=${remote.id} userLogin=${data?.user_login ?? '?'}`);
     return { userLogin: data?.user_login, siteurl: data?.siteurl };
+  }
+
+  async cleanupRemoteUploadResidue(
+    remoteId: string,
+    onProgress?: (msg: string) => void
+  ): Promise<any> {
+    const { remote, appPassword } = await this.getRemoteWithPass(remoteId);
+    Logger.log(`[RemoteService] cleanupRemoteUploadResidue start remote=${remote.name} id=${remote.id}`);
+
+    onProgress?.('Проверка агента перед очисткой...');
+    await this.ensureAgent(remote, appPassword);
+
+    onProgress?.('Очистка незавершённых Push-загрузок на сервере...');
+    const result = await this.agentRequest(remote.url, appPassword, 'cleanup_uploads', {}, AGENT_HEAVY_OP_TIMEOUT_MS);
+    Logger.log(`[RemoteService] cleanupRemoteUploadResidue success remote=${remote.name} id=${remote.id} result=${JSON.stringify(result ?? {})}`);
+    return result;
   }
 
   async recordSyncEvent(
@@ -1100,6 +1304,7 @@ if (!defined('ABSPATH')) { exit; }
         if (!this.isRecoverablePackError(err) || attempt === MAX_ATTEMPTS) {
           throw err;
         }
+        this.clearTransferState(localPath, remote.id);
         Logger.log(`[RemoteService] pullSite pack attempt ${attempt}/${MAX_ATTEMPTS} failed (${this.formatShortError(err)}); restarting pack job`);
         onProgress('packaging', 'Перезапуск упаковки на сервере...', 0);
         await new Promise((resolve) => setTimeout(resolve, 800));
@@ -1144,6 +1349,23 @@ if (!defined('ABSPATH')) { exit; }
     return err instanceof Error ? err : new Error(String(err));
   }
 
+  private async canResumePackJob(
+    remote: RemoteSite,
+    appPassword: string,
+    state: PullPackTransferState
+  ): Promise<boolean> {
+    if (!state.jobId || state.completed) { return !!state.completed; }
+    try {
+      const params: any = { job_id: state.jobId };
+      if (state.shards >= 2) { params.shard = 0; }
+      await this.agentRequest(remote.url, appPassword, 'pack_status', params, AGENT_REQUEST_TIMEOUT_MS);
+      return true;
+    } catch (err) {
+      Logger.log(`[RemoteService] pack resume state validation failed job=${state.jobId}: ${this.formatShortError(err)}`);
+      return false;
+    }
+  }
+
   /** Runs a single pack job (START + poll to completion).
    *
    *  Agent ≥1.3.3 streams each batch as its own small ZIP part (`part_token`);
@@ -1161,10 +1383,45 @@ if (!defined('ABSPATH')) { exit; }
     agentVersion?: string
   ): Promise<any> {
     const { unzipBuffer } = await import('../utils/zipUtils');
+    const resumable = !!agentVersion && this.compareSemver(agentVersion, '1.3.7') >= 0;
+    const packKey = this.makePullPackKey(remote, exclude);
+    const transferState = this.readTransferState(localPath, remote.id) ?? this.baseTransferState(remote.id);
+    let pullPack = resumable && transferState.pullPack?.key === packKey
+      ? transferState.pullPack
+      : undefined;
+    if (pullPack && (!pullPack.streams || typeof pullPack.streams !== 'object')) {
+      pullPack.streams = {};
+    }
 
-    let packResult = await this.agentRequest(remote.url, appPassword, 'pack_files', {
-      exclude,
-    }, AGENT_HEAVY_OP_TIMEOUT_MS);
+    if (pullPack?.completed) {
+      Logger.log(`[RemoteService] pullSite pack_files RESUME already completed job=${pullPack.jobId} parts=${pullPack.parts ?? 0} bytes=${this.formatBytes(pullPack.bytes ?? 0)}`);
+      onProgress('packaging', 'Файлы уже перенесены, продолжаю Pull...', 60);
+      return { streamed: true, parts: pullPack.parts ?? 0, bytes: pullPack.bytes ?? 0, total: pullPack.total };
+    }
+
+    if (pullPack) {
+      const stillUsable = await this.canResumePackJob(remote, appPassword, pullPack);
+      if (!stillUsable) {
+        Logger.log(`[RemoteService] pullSite pack_files resume state is stale; starting fresh job=${pullPack.jobId}`);
+        transferState.pullPack = undefined;
+        this.writeTransferState(localPath, remote.id, transferState);
+        pullPack = undefined;
+      }
+    }
+
+    let packResult: any;
+    if (!pullPack) {
+      packResult = await this.agentRequest(remote.url, appPassword, 'pack_files', {
+        exclude,
+      }, AGENT_HEAVY_OP_TIMEOUT_MS);
+    } else {
+      packResult = {
+        job_id: pullPack.jobId,
+        total: pullPack.total,
+        shards: pullPack.shards,
+        resumed: true,
+      };
+    }
 
     const packJobId = packResult?.job_id ? String(packResult.job_id) : '';
     if (!packJobId) {
@@ -1176,20 +1433,44 @@ if (!defined('ABSPATH')) { exit; }
     }
 
     const packTotal = Number(packResult?.total || 0);
+    if (resumable && !pullPack) {
+      pullPack = {
+        key: packKey,
+        jobId: packJobId,
+        total: packTotal,
+        shards: Number(packResult?.shards || 0) || 1,
+        agentVersion: agentVersion || '',
+        streams: {},
+      };
+      transferState.pullPack = pullPack;
+      this.writeTransferState(localPath, remote.id, transferState);
+    }
+
+    const persistPullPack = () => {
+      if (!pullPack) { return; }
+      transferState.pullPack = pullPack;
+      this.writeTransferState(localPath, remote.id, transferState);
+    };
 
     // Parallel shards (agent ≥1.3.5): the server split the manifest into K
     // disjoint slices, each with its own cursor. Pack+download them concurrently
     // to beat per-connection throttling on shared hosts.
     const packShards = Number(packResult?.shards || 0);
     if (packShards >= 2) {
-      return await this.runPackJobSharded(
-        remote, appPassword, localPath, onProgress, packJobId, packTotal, packShards, agentVersion,
+      const result = await this.runPackJobSharded(
+        remote, appPassword, localPath, onProgress, packJobId, packTotal, packShards, agentVersion, pullPack, persistPullPack,
       );
+      if (pullPack) {
+        pullPack.completed = true;
+        pullPack.parts = Object.values(pullPack.streams).reduce((sum, stream) => sum + Math.max(0, Number(stream.nextSeq || 0)), 0);
+        pullPack.bytes = Number(result?.bytes || 0);
+        persistPullPack();
+      }
+      return result;
     }
 
     // Resumable single stream (agent ≥1.3.7): recover a stalled CONTINUE in place
     // (drain missed parts by seq + resume) instead of restarting the whole pack.
-    const resumable = !!agentVersion && this.compareSemver(agentVersion, '1.3.7') >= 0;
     if (resumable) {
       Logger.log(`[RemoteService] pullSite pack_files START(resumable) job=${packJobId} total=${packTotal} agent=${agentVersion || '?'}`);
       const r = await this.runPackStreamResumable(
@@ -1198,8 +1479,17 @@ if (!defined('ABSPATH')) { exit; }
           const ratio = packTotal > 0 ? Math.min(1, processed / packTotal) : 0;
           onProgress('packaging', `Перенос файлов с сервера... ${processed}/${packTotal}`, Math.round(ratio * 60));
         },
+        () => false,
+        pullPack,
+        persistPullPack,
       );
       Logger.log(`[RemoteService] pullSite pack_files(resumable) complete parts=${r.parts} size=${this.formatBytes(r.bytes)} total=${packTotal}`);
+      if (pullPack) {
+        pullPack.completed = true;
+        pullPack.parts = Object.values(pullPack.streams).reduce((sum, stream) => sum + Math.max(0, Number(stream.nextSeq || 0)), 0) || r.parts;
+        pullPack.bytes = r.bytes;
+        persistPullPack();
+      }
       return { streamed: true, parts: r.parts, bytes: r.bytes, total: packTotal };
     }
 
@@ -1314,6 +1604,8 @@ if (!defined('ABSPATH')) { exit; }
     packTotal: number,
     shards: number,
     agentVersion?: string,
+    pullPack?: PullPackTransferState,
+    persistPullPack: () => void = () => {},
   ): Promise<any> {
     const { unzipBuffer } = await import('../utils/zipUtils');
     const shardProcessed = new Array(shards).fill(0);
@@ -1340,6 +1632,8 @@ if (!defined('ABSPATH')) { exit; }
             remote, appPassword, localPath, packJobId, k,
             (processed) => { shardProcessed[k] = processed; polls++; emitProgress(); },
             () => aborted,
+            pullPack,
+            persistPullPack,
           );
           partsExtracted += r.parts;
           bytesExtracted += r.bytes;
@@ -1456,15 +1750,39 @@ if (!defined('ABSPATH')) { exit; }
     shard: number,
     onStreamProgress: (processedInSlice: number) => void,
     isAborted: () => boolean = () => false,
+    pullPack?: PullPackTransferState,
+    persistPullPack: () => void = () => {},
   ): Promise<{ parts: number; bytes: number }> {
     const { unzipBuffer } = await import('../utils/zipUtils');
     const tag = `job=${jobId}${shard >= 0 ? ` shard=${shard}` : ''}`;
-    let nextSeq = 0;
+    const streamKey = shard >= 0 ? `s${shard}` : 'main';
+    const savedStream = pullPack?.streams?.[streamKey];
+    if (savedStream?.done) {
+      Logger.log(`[RemoteService] pack resume ${tag} stream already done nextSeq=${savedStream.nextSeq} processed=${savedStream.processed}`);
+      onStreamProgress(Number(savedStream.processed || 0));
+      return { parts: 0, bytes: 0 };
+    }
+    let nextSeq = Math.max(0, Number(savedStream?.nextSeq || 0));
     let partsExtracted = 0;
     let bytesExtracted = 0;
-    let processedInSlice = 0;
+    let processedInSlice = Math.max(0, Number(savedStream?.processed || 0));
     let done = false;
     let polls = 0;
+
+    if (nextSeq > 0 || processedInSlice > 0) {
+      Logger.log(`[RemoteService] pack resume ${tag} client state nextSeq=${nextSeq} processed=${processedInSlice}`);
+      onStreamProgress(processedInSlice);
+    }
+
+    const persistStream = (doneFlag = false) => {
+      if (!pullPack) { return; }
+      pullPack.streams[streamKey] = {
+        nextSeq,
+        processed: processedInSlice,
+        done: doneFlag || done,
+      };
+      persistPullPack();
+    };
 
     const continueReq = () => {
       const params: any = { job_id: jobId, seq_dl: 1 };
@@ -1483,8 +1801,15 @@ if (!defined('ABSPATH')) { exit; }
         const knownSeq = res?.part_seq !== undefined ? Number(res.part_seq) : -1;
         const knownSize = Number(res?.part_size || 0);
         if (serverParts > nextSeq) {
-          const d = await this.drainParts(remote, appPassword, localPath, jobId, shard, nextSeq, serverParts, unzipBuffer, knownSeq, knownSize);
-          nextSeq = d.nextSeq; partsExtracted += d.count; bytesExtracted += d.bytes;
+          await this.drainParts(
+            remote, appPassword, localPath, jobId, shard, nextSeq, serverParts, unzipBuffer, knownSeq, knownSize,
+            async (newNextSeq, partBytes) => {
+              nextSeq = newNextSeq;
+              partsExtracted++;
+              bytesExtracted += partBytes;
+              persistStream(false);
+            },
+          );
         }
         onStreamProgress(processedInSlice);
       } catch (err) {
@@ -1494,8 +1819,16 @@ if (!defined('ABSPATH')) { exit; }
         if (!this.isTransientPullError(err)) {
           throw this.asRecoverablePackError(err, `resumable ${tag}`);
         }
-        const rec = await this.recoverPackStream(remote, appPassword, localPath, jobId, shard, nextSeq, unzipBuffer);
-        nextSeq = rec.nextSeq; partsExtracted += rec.count; bytesExtracted += rec.bytes;
+        const rec = await this.recoverPackStream(
+          remote, appPassword, localPath, jobId, shard, nextSeq, unzipBuffer,
+          async (newNextSeq, partBytes) => {
+            nextSeq = newNextSeq;
+            partsExtracted++;
+            bytesExtracted += partBytes;
+            persistStream(false);
+          },
+        );
+        nextSeq = rec.nextSeq;
         done = rec.done; processedInSlice = rec.processed;
         onStreamProgress(processedInSlice);
         Logger.log(`[RemoteService] pack resume ${tag} drained=${rec.count} nextSeq=${nextSeq} done=${done} processed=${processedInSlice}`);
@@ -1504,6 +1837,7 @@ if (!defined('ABSPATH')) { exit; }
         Logger.log(`[RemoteService] pack(resumable) ${tag} processed=${processedInSlice} parts=${partsExtracted} polls=${polls}`);
       }
     }
+    persistStream(true);
     return { parts: partsExtracted, bytes: bytesExtracted };
   }
 
@@ -1518,6 +1852,7 @@ if (!defined('ABSPATH')) { exit; }
     shard: number,
     nextSeq: number,
     unzipBuffer: (buf: Buffer, dest: string) => void,
+    onPartExtracted?: (nextSeq: number, partBytes: number) => Promise<void>,
   ): Promise<{ nextSeq: number; count: number; bytes: number; done: boolean; processed: number }> {
     const tag = `job=${jobId}${shard >= 0 ? ` shard=${shard}` : ''}`;
     let status: any;
@@ -1541,7 +1876,7 @@ if (!defined('ABSPATH')) { exit; }
       }
     }
     const serverParts = Number(status?.parts ?? nextSeq);
-    const d = await this.drainParts(remote, appPassword, localPath, jobId, shard, nextSeq, serverParts, unzipBuffer);
+    const d = await this.drainParts(remote, appPassword, localPath, jobId, shard, nextSeq, serverParts, unzipBuffer, -1, 0, onPartExtracted);
     return { nextSeq: d.nextSeq, count: d.count, bytes: d.bytes, done: !!status?.done, processed: Number(status?.processed || 0) };
   }
 
@@ -1558,6 +1893,7 @@ if (!defined('ABSPATH')) { exit; }
     unzipBuffer: (buf: Buffer, dest: string) => void,
     knownPartSeq: number = -1,
     knownPartSize: number = 0,
+    onPartExtracted?: (nextSeq: number, partBytes: number) => Promise<void>,
   ): Promise<{ nextSeq: number; count: number; bytes: number }> {
     let count = 0;
     let bytes = 0;
@@ -1568,6 +1904,7 @@ if (!defined('ABSPATH')) { exit; }
       unzipBuffer(buf, localPath);
       count++;
       bytes += buf.length;
+      await onPartExtracted?.(seq + 1, buf.length);
       await this.ackPart(remote, appPassword, jobId, seq, shard);
     }
     return { nextSeq: seq, count, bytes };
@@ -1613,9 +1950,43 @@ if (!defined('ABSPATH')) { exit; }
     /** Directory where database.sql / database.meta.json are written. Defaults to localPath. */
     dbOutPath?: string,
     /** Skip wp-content/uploads (media) entirely — biggest speedup for dev pulls. */
-    skipUploads: boolean = false
+    skipUploads: boolean = false,
+    /** Transfer only files changed since the last successful hosting sync. */
+    incremental: boolean = false
   ): Promise<void> {
-    const { remote, appPassword } = await this.getRemoteWithPass(remoteId);
+    const { remote, appPassword } = await this.getRemoteWithOptionalPass(remoteId);
+    if (incremental) {
+      await this.pullChangedFiles(remote, localPath, skipUploads, onProgress, appPassword);
+      if (includeDb) {
+        if ((remote.fileTransferMode ?? 'agent') === 'ftp') {
+          const ftpPassword = await this.getRemoteFtpPassword(remote.id);
+          await this.exportDatabaseViaFtpBridge(remote, ftpPassword, dbOutPath ?? localPath, onProgress);
+        } else {
+          if (!appPassword) {
+            throw new Error('Для incremental Pull базы через агент нужен WordPress Application Password.');
+          }
+          onProgress('db', 'Экспорт базы данных...', 92);
+          const dbResult = await this.agentRequest(remote.url, appPassword, 'export_db', {}, AGENT_HEAVY_OP_TIMEOUT_MS);
+          const sqlBuffer = await this.downloadFromAgent(remote.url, appPassword, dbResult.file_token);
+          this.assertValidSqlDump(sqlBuffer);
+          const dbDir = dbOutPath ?? localPath;
+          fs.writeFileSync(path.join(dbDir, 'database.sql'), sqlBuffer);
+          if (dbResult?.db_stats) {
+            fs.writeFileSync(path.join(dbDir, 'database.meta.json'), JSON.stringify(dbResult.db_stats, null, 2), 'utf-8');
+          }
+        }
+      }
+      onProgress('done', 'Incremental Pull завершен!', 100);
+      this.clearTransferState(localPath, remote.id);
+      return;
+    }
+    if ((remote.fileTransferMode ?? 'agent') === 'ftp') {
+      await this.pullSiteViaFtp(remote, localPath, includeDb, onProgress, dbOutPath, skipUploads);
+      return;
+    }
+    if (!appPassword) {
+      throw new Error('Для Pull через агент нужен WordPress Application Password. Укажите его в настройках remote или выберите FTP.');
+    }
 
     onProgress('connecting', 'Подключение к удаленному сайту...');
     Logger.log(`[RemoteService] pullSite START remoteId=${remoteId} url=${remote.url} includeDb=${includeDb} skipUploads=${skipUploads}`);
@@ -1674,7 +2045,7 @@ if (!defined('ABSPATH')) { exit; }
 
     if (useMediaDirect) {
       // Media phase occupies 60→90%; DB (if any) finishes the last 10%.
-      const mediaResult = await this.pullUploadsDirect(remote, appPassword, localPath, onProgress, 60, 30);
+      const mediaResult = await this.pullUploadsDirect(remote, appPassword, localPath, onProgress, 60, 30, agentVersion);
       Logger.log(`[RemoteService] pullSite media transferred downloaded=${mediaResult.downloaded}/${mediaResult.total} failed=${mediaResult.failed} bytes=${this.formatBytes(mediaResult.bytes)}`);
     }
 
@@ -1711,6 +2082,8 @@ if (!defined('ABSPATH')) { exit; }
     }
 
     Logger.log(`[RemoteService] pullSite SUCCESS remoteId=${remoteId}`);
+    await this.saveSyncStateFromRemote(remote, localPath, false, skipUploads, appPassword);
+    this.clearTransferState(localPath, remote.id);
     onProgress('done', 'Pull завершен!', 100);
   }
 
@@ -1725,8 +2098,48 @@ if (!defined('ABSPATH')) { exit; }
     /** Explicit path to database.sql. Defaults to database.sql inside localPath. */
     dbFilePath?: string,
     /** Keep remote WP users, usermeta and auth-keys intact after DB import. Default: true. */
-    preserveCredentials = true
+    preserveCredentials = true,
+    /** Transfer only files changed since the last successful hosting sync. */
+    incremental: boolean = false
   ): Promise<void> {
+    this.resetAdaptiveUploadTuning();
+
+    if (incremental) {
+      const { remote, appPassword } = await this.getRemoteWithOptionalPass(remoteId);
+      await this.pushChangedFiles(remote, localPath, devMode, onProgress, appPassword);
+      if (includeDb) {
+        const sqlFile = dbFilePath ?? path.join(localPath, 'database.sql');
+        if ((remote.fileTransferMode ?? 'agent') === 'ftp') {
+          const ftpPassword = await this.getRemoteFtpPassword(remote.id);
+          await this.importDatabaseViaFtpBridge(remote, ftpPassword, sqlFile, preserveCredentials, onProgress);
+        } else {
+          if (!appPassword) {
+            throw new Error('Для incremental Push базы через агент нужен WordPress Application Password.');
+          }
+          if (fs.existsSync(sqlFile)) {
+            onProgress('db', 'Загрузка базы данных...', 80);
+            const dbToken = await this.uploadToAgent(remote.url, appPassword, sqlFile);
+            onProgress('db', 'Импорт базы данных на сервере...', 92);
+            await this.agentRequest(remote.url, appPassword, 'import_db', {
+              file_token: dbToken,
+              target_url: remote.url,
+              preserve_credentials: preserveCredentials,
+            }, AGENT_HEAVY_OP_TIMEOUT_MS);
+          }
+        }
+      }
+      onProgress('done', 'Incremental Push завершен!', 100);
+      this.clearTransferState(localPath, remote.id);
+      return;
+    }
+
+    const remoteForMode = this.getRemote(remoteId);
+    if ((remoteForMode?.fileTransferMode ?? 'agent') === 'ftp') {
+      const { remote } = await this.getRemoteWithOptionalPass(remoteId);
+      await this.pushSiteViaFtp(remote, localPath, includeDb, devMode, onProgress, dbFilePath, preserveCredentials);
+      return;
+    }
+
     // ✅ OPTIMIZATION: Add timing to profile each phase
     const startTotal = Date.now();
     const timings: Record<string, number> = {};
@@ -1764,51 +2177,155 @@ if (!defined('ABSPATH')) { exit; }
     }, 800);
 
     try {
-      await this.createZip(localPath, zipPath, archiver, devMode, true, (n) => { packedCount = n; });
-      clearInterval(packHeartbeat);
+      const splitPlan = await this.createPushArchivePlan(localPath, devMode);
+      const useSplitPush = splitPlan.totalBytes > PUSH_SPLIT_THRESHOLD_BYTES && splitPlan.parts.length > 1;
+      const pushPlanKey = this.makePushPlanKey(splitPlan, devMode);
+      const expectedPushMode: PushFilesTransferState['mode'] = useSplitPush ? 'split' : 'single';
+      let transferState = this.readTransferState(localPath, remote.id) ?? this.baseTransferState(remote.id);
+      const pushFilesState = transferState.pushFiles?.planKey === pushPlanKey && transferState.pushFiles.mode === expectedPushMode
+        ? transferState.pushFiles
+        : undefined;
 
-      const zipStats = fs.statSync(zipPath);
-      const packElapsed = Date.now() - packStart;
-      markTime('createZip');
-      Logger.log(
-        `[PUSH-STATS] packaging complete size=${this.formatBytes(zipStats.size)} ` +
-        `elapsed=${packElapsed}ms speed=${this.formatBytes(zipStats.size / (packElapsed / 1000))}/s`
-      );
+      if (transferState.pushFiles && !pushFilesState) {
+        transferState.pushFiles = undefined;
+        this.writeTransferState(localPath, remote.id, transferState);
+      }
 
-      onProgress('uploading', 'Загрузка файлов на удаленный сервер...', 30);
-      const uploadStart = Date.now();
-      const uploadToken = await this.uploadToAgent(
-        remote.url,
-        appPassword,
-        zipPath,
-        (uploadedBytes, totalBytes) => {
-          const ratio = totalBytes > 0 ? uploadedBytes / totalBytes : 1;
-          const pct = 30 + Math.round(Math.min(1, ratio) * 35);
-          onProgress(
-            'uploading',
-            `Загрузка файлов на удаленный сервер... ${this.formatBytes(uploadedBytes)} / ${this.formatBytes(totalBytes)}`,
-            pct
-          );
+      // Resume-состояние "файлы уже перенесены" нельзя брать на веру: сервер могли
+      // очистить/переустановить после прошлого Push. Сверяем план с реальным manifest.
+      let filesAlreadyApplied = false;
+      let prefetchedRemoteMap: Record<string, FileManifestEntry> | undefined;
+      if (pushFilesState?.completed) {
+        clearInterval(packHeartbeat);
+        onProgress('verifying', 'Проверка ранее перенесённых файлов на сервере...', 65);
+        try {
+          prefetchedRemoteMap = await this.fetchAgentManifestMap(remote.url, appPassword, devMode);
+          const missing = this.findMissingOnRemote(splitPlan.entries, prefetchedRemoteMap);
+          filesAlreadyApplied = missing.length === 0;
+          if (!filesAlreadyApplied) {
+            Logger.log(
+              `[RemoteService] pushSite RESUME state stale: на сервере нет ${missing.length} файлов ` +
+              `sample=${missing.slice(0, 5).join(', ')} — загружаю заново`
+            );
+            onProgress('verifying', `На сервере не хватает ${missing.length} файлов — загружаю заново...`, 66);
+          }
+        } catch (err) {
+          Logger.log(`[RemoteService] pushSite RESUME verify failed (${this.formatShortError(err)}) — загружаю заново`);
         }
-      );
-      const uploadElapsed = Date.now() - uploadStart;
-      markTime('uploadToAgent');
-      Logger.log(
-        `[PUSH-STATS] upload complete elapsed=${uploadElapsed}ms ` +
-        `speed=${this.formatBytes(zipStats.size / (uploadElapsed / 1000))}/s`
-      );
-      Logger.log(`[RemoteService] pushSite files uploaded token=${uploadToken}`);
+        if (!filesAlreadyApplied) {
+          if (pushFilesState.mode === 'split') {
+            // Оставляем completedParts: pushSplitArchives проверит каждую часть и
+            // перезальёт только те, чьих файлов реально нет на сервере.
+            pushFilesState.completed = false;
+          } else {
+            transferState.pushFiles = undefined;
+          }
+          this.writeTransferState(localPath, remote.id, transferState);
+        }
+      }
 
-      onProgress('extracting', 'Распаковка на удаленном сервере...', 70);
-      const extractStart = Date.now();
-      const extractResult = await this.retryAsync('extract_files', 2, () => this.agentRequest(remote.url, appPassword, 'extract_files', {
-        file_token: uploadToken,
-      }, AGENT_HEAVY_OP_TIMEOUT_MS));
-      const extractElapsed = Date.now() - extractStart;
-      markTime('agentExtract');
-      Logger.log(
-        `[PUSH-STATS] extract complete elapsed=${extractElapsed}ms result=${JSON.stringify(extractResult ?? {})}`
-      );
+      if (filesAlreadyApplied) {
+        Logger.log(`[RemoteService] pushSite RESUME files already applied (verified on remote) plan=${pushPlanKey}`);
+        onProgress('extracting', 'Файлы уже перенесены (проверено на сервере), продолжаю Push...', 70);
+        markTime('filesAlreadyApplied');
+      } else if (useSplitPush) {
+        clearInterval(packHeartbeat);
+        const filesStart = Date.now();
+        const splitResult = await this.pushSplitArchives(
+          remote.id,
+          remote.url,
+          appPassword,
+          localPath,
+          splitPlan,
+          pushPlanKey,
+          archiver,
+          devMode,
+          onProgress,
+          prefetchedRemoteMap
+        );
+        markTime('pushSplitArchives');
+        Logger.log(
+          `[PUSH-STATS] split files push complete archives=${splitResult.archiveCount} ` +
+          `uploaded=${this.formatBytes(splitResult.archiveBytes)} elapsed=${Date.now() - filesStart}ms`
+        );
+      } else {
+        await this.createZip(localPath, zipPath, archiver, devMode, true, (n) => { packedCount = n; });
+        clearInterval(packHeartbeat);
+
+        const zipStats = fs.statSync(zipPath);
+        const packElapsed = Date.now() - packStart;
+        markTime('createZip');
+        Logger.log(
+          `[PUSH-STATS] packaging complete size=${this.formatBytes(zipStats.size)} ` +
+          `elapsed=${packElapsed}ms speed=${this.formatBytes(zipStats.size / (packElapsed / 1000))}/s`
+        );
+
+        onProgress('uploading', 'Загрузка файлов на удаленный сервер...', 30);
+        const uploadStart = Date.now();
+        const uploadToken = await this.uploadToAgent(
+          remote.url,
+          appPassword,
+          zipPath,
+          (uploadedBytes, totalBytes) => {
+            const ratio = totalBytes > 0 ? uploadedBytes / totalBytes : 1;
+            const pct = 30 + Math.round(Math.min(1, ratio) * 35);
+            onProgress(
+              'uploading',
+              `Загрузка файлов на удаленный сервер... ${this.formatBytes(uploadedBytes)} / ${this.formatBytes(totalBytes)}`,
+              pct
+            );
+          }
+        );
+        const uploadElapsed = Date.now() - uploadStart;
+        markTime('uploadToAgent');
+        Logger.log(
+          `[PUSH-STATS] upload complete elapsed=${uploadElapsed}ms ` +
+          `speed=${this.formatBytes(zipStats.size / (uploadElapsed / 1000))}/s`
+        );
+        Logger.log(`[RemoteService] pushSite files uploaded token=${uploadToken}`);
+
+        onProgress('extracting', 'Распаковка на удаленном сервере...', 70);
+        const extractStart = Date.now();
+        const extractResult = await this.retryAsync('extract_files', 2, () => this.agentRequest(remote.url, appPassword, 'extract_files', {
+          file_token: uploadToken,
+        }, AGENT_HEAVY_OP_TIMEOUT_MS));
+        const extractElapsed = Date.now() - extractStart;
+        markTime('agentExtract');
+        Logger.log(
+          `[PUSH-STATS] extract complete elapsed=${extractElapsed}ms result=${JSON.stringify(extractResult ?? {})}`
+        );
+        transferState = this.readTransferState(localPath, remote.id) ?? this.baseTransferState(remote.id);
+        transferState.pushFiles = { planKey: pushPlanKey, mode: 'single', completed: true };
+        this.writeTransferState(localPath, remote.id, transferState);
+      }
+
+      // Контрольная сверка: не верим "успеху" распаковки на слово — проверяем,
+      // что все файлы плана реально существуют на сервере.
+      if (!filesAlreadyApplied) {
+        onProgress('verifying', 'Проверка загруженных файлов на сервере...', 77);
+        let verifyMap: Record<string, FileManifestEntry> | undefined;
+        try {
+          verifyMap = await this.fetchAgentManifestMap(remote.url, appPassword, devMode);
+        } catch (err) {
+          Logger.log(`[PUSH-VERIFY] manifest недоступен, проверка пропущена: ${this.formatShortError(err)}`);
+          onProgress('verifying', 'Проверка файлов недоступна (агент не поддерживает manifest) — пропускаю', 78);
+        }
+        if (verifyMap) {
+          const missing = this.findMissingOnRemote(splitPlan.entries, verifyMap);
+          markTime('verifyFiles');
+          if (missing.length > 0) {
+            const uploadsMissing = missing.filter((rel) => rel.toLowerCase().startsWith('wp-content/uploads/')).length;
+            Logger.log(`[PUSH-VERIFY] FAILED missing=${missing.length} uploads=${uploadsMissing} sample=${missing.slice(0, 20).join(', ')}`);
+            throw new Error(
+              `Push не подтверждён: после загрузки на сервере отсутствует ${missing.length} файлов` +
+              (uploadsMissing > 0 ? ` (из них в uploads: ${uploadsMissing})` : '') +
+              `. Примеры: ${missing.slice(0, 5).join(', ')}. Повторите Push — недостающие части будут догружены.`
+            );
+          }
+          Logger.log(`[PUSH-VERIFY] OK files=${splitPlan.entries.length}`);
+          onProgress('verifying', `Проверено: все ${splitPlan.entries.length} файлов на сервере`, 78);
+        }
+      }
 
       if (includeDb) {
         const sqlFile = dbFilePath ?? path.join(localPath, 'database.sql');
@@ -1871,6 +2388,8 @@ if (!defined('ABSPATH')) { exit; }
           .map(([k, v]) => `${k}=${v}ms`)
           .join(', ')}}`
       );
+      await this.saveSyncStateFromRemote(remote, localPath, devMode, false, appPassword);
+      this.clearTransferState(localPath, remote.id);
       onProgress('done', 'Push завершен!', 100);
     } finally {
       clearInterval(packHeartbeat);
@@ -1882,6 +2401,1018 @@ if (!defined('ABSPATH')) { exit; }
         }
       }
     }
+  }
+
+  // ── FTP + incremental hosting sync ───────────────────────────────────────
+
+  private async pullSiteViaFtp(
+    remote: RemoteSite,
+    localPath: string,
+    includeDb: boolean,
+    onProgress: (phase: string, msg: string, pct?: number) => void,
+    dbOutPath: string | undefined,
+    skipUploads: boolean
+  ): Promise<void> {
+    if (!remote.ftp) { throw new Error('FTP настройки не заданы для этого remote.'); }
+    const ftpPassword = await this.getRemoteFtpPassword(remote.id);
+    onProgress('connecting', 'Подключение по FTP...', 5);
+    let remoteManifest: FileManifestEntry[] = [];
+
+    await this.withFtpClient(remote.ftp, ftpPassword, async (client) => {
+      remoteManifest = await this.listFtpManifest(client, remote.ftp!, false, skipUploads);
+      const planKey = this.makeManifestPlanKey(remoteManifest, { mode: 'ftp-pull', skipUploads });
+      const transferState = this.readTransferState(localPath, remote.id) ?? this.baseTransferState(remote.id);
+      let pullState = transferState.ftpPull?.planKey === planKey && transferState.ftpPull.mode === 'ftp'
+        ? transferState.ftpPull
+        : undefined;
+      if (!pullState) {
+        pullState = { planKey, mode: 'ftp', completedFiles: {} };
+        transferState.ftpPull = pullState;
+        this.writeTransferState(localPath, remote.id, transferState);
+      }
+      const totalBytes = remoteManifest.reduce((sum, item) => sum + item.size, 0);
+      let doneBytes = 0;
+      let doneCount = 0;
+      onProgress('downloading', `FTP Pull: найдено ${remoteManifest.length} файлов`, 10);
+      for (const entry of remoteManifest) {
+        const localFile = this.resolveLocalRel(localPath, entry.rel);
+        const completed = pullState.completedFiles?.[entry.rel];
+        const localEntry = this.localFileManifestEntry(localFile, entry.rel);
+        if (completed && this.sameFileSig(completed, entry, false) && this.sameFileSig(localEntry, entry, false)) {
+          Logger.log(`[RemoteService] FTP Pull resume skip completed rel=${entry.rel}`);
+        } else {
+          fs.mkdirSync(path.dirname(localFile), { recursive: true });
+          await this.downloadFtpFileResumable(client, this.ftpJoin(remote.ftp!.rootPath, entry.rel), localFile, entry, localPath, remote.id);
+          pullState.completedFiles = pullState.completedFiles ?? {};
+          pullState.completedFiles[entry.rel] = entry;
+          transferState.ftpPull = pullState;
+          this.writeTransferState(localPath, remote.id, transferState);
+        }
+        doneBytes += entry.size;
+        doneCount++;
+        const pct = 10 + Math.round((doneBytes / Math.max(1, totalBytes)) * 75);
+        onProgress('downloading', `FTP Pull: ${doneCount}/${remoteManifest.length} файлов (${this.formatBytes(doneBytes)})`, pct);
+      }
+    });
+
+    if (includeDb) {
+      await this.exportDatabaseViaFtpBridge(remote, ftpPassword, dbOutPath ?? localPath, onProgress);
+    }
+
+    await this.saveSyncStateFromManifests(remote.id, localPath, remoteManifest);
+    this.clearTransferState(localPath, remote.id);
+    onProgress('done', 'FTP Pull завершен!', 100);
+  }
+
+  private async pushSiteViaFtp(
+    remote: RemoteSite,
+    localPath: string,
+    includeDb: boolean,
+    devMode: boolean,
+    onProgress: (phase: string, msg: string, pct?: number) => void,
+    dbFilePath: string | undefined,
+    preserveCredentials: boolean
+  ): Promise<void> {
+    if (!remote.ftp) { throw new Error('FTP настройки не заданы для этого remote.'); }
+    const ftpPassword = await this.getRemoteFtpPassword(remote.id);
+    const localManifest = await this.listLocalManifest(localPath, devMode, false);
+    const planKey = this.makeManifestPlanKey(localManifest, { mode: 'ftp-push', devMode });
+    onProgress('connecting', 'Подключение по FTP...', 5);
+
+    await this.withFtpClient(remote.ftp, ftpPassword, async (client) => {
+      await client.ensureDir(remote.ftp!.rootPath || '/');
+      const transferState = this.readTransferState(localPath, remote.id) ?? this.baseTransferState(remote.id);
+      let pushState = transferState.pushFiles?.planKey === planKey && transferState.pushFiles.mode === 'ftp'
+        ? transferState.pushFiles
+        : undefined;
+      if (!pushState) {
+        pushState = { planKey, mode: 'ftp', completedFiles: {} };
+        transferState.pushFiles = pushState;
+        this.writeTransferState(localPath, remote.id, transferState);
+      }
+      const totalBytes = localManifest.reduce((sum, item) => sum + item.size, 0);
+      let doneBytes = 0;
+      let doneCount = 0;
+      onProgress('uploading', `FTP Push: загрузка ${localManifest.length} файлов`, 10);
+      for (const entry of localManifest) {
+        const localFile = this.resolveLocalRel(localPath, entry.rel);
+        const remoteFile = this.ftpJoin(remote.ftp!.rootPath, entry.rel);
+        const completed = pushState.completedFiles?.[entry.rel];
+        const remoteSize = await this.getFtpFileSize(client, remoteFile);
+        if (completed && this.sameFileSig(completed, entry, false) && remoteSize === entry.size) {
+          Logger.log(`[RemoteService] FTP Push resume skip completed rel=${entry.rel}`);
+        } else {
+          await client.ensureDir(path.posix.dirname(remoteFile));
+          await this.uploadFtpFileResumable(client, localFile, remoteFile, entry.size);
+          pushState.completedFiles = pushState.completedFiles ?? {};
+          pushState.completedFiles[entry.rel] = entry;
+          transferState.pushFiles = pushState;
+          this.writeTransferState(localPath, remote.id, transferState);
+        }
+        doneBytes += entry.size;
+        doneCount++;
+        const pct = 10 + Math.round((doneBytes / Math.max(1, totalBytes)) * 75);
+        onProgress('uploading', `FTP Push: ${doneCount}/${localManifest.length} файлов (${this.formatBytes(doneBytes)})`, pct);
+      }
+    });
+
+    if (includeDb) {
+      await this.importDatabaseViaFtpBridge(remote, ftpPassword, dbFilePath ?? path.join(localPath, 'database.sql'), preserveCredentials, onProgress);
+    }
+
+    await this.saveSyncStateFromRemote(remote, localPath, devMode, false);
+    this.clearTransferState(localPath, remote.id);
+    onProgress('done', 'FTP Push завершен!', 100);
+  }
+
+  private async pullChangedFiles(
+    remote: RemoteSite,
+    localPath: string,
+    skipUploads: boolean,
+    onProgress: (phase: string, msg: string, pct?: number) => void,
+    appPassword?: string
+  ): Promise<void> {
+    onProgress('connecting', 'Проверка изменённых файлов на хостинге...', 5);
+    const remoteManifest = await this.getRemoteFileManifest(remote, false, skipUploads, appPassword);
+    const remoteMap = this.manifestMap(remoteManifest);
+    const localMap = this.manifestMap(await this.listLocalManifest(localPath, false, skipUploads));
+    const state = this.readSyncState(localPath, remote.id);
+    const baseline = state?.remote ?? {};
+    const hasBaseline = Object.keys(baseline).length > 0;
+
+    const changed = remoteManifest.filter((entry) => {
+      const local = localMap[entry.rel];
+      if (local && this.sameFileSig(entry, local, false)) { return false; }
+      const previous = baseline[entry.rel];
+      if (hasBaseline) { return !previous || !this.sameFileSig(entry, previous); }
+      return !local || !this.sameFileSig(entry, local, false);
+    });
+    const deleted = hasBaseline
+      ? Object.keys(baseline).filter((rel) => !remoteMap[rel] && !!localMap[rel])
+      : [];
+
+    const totalBytes = changed.reduce((sum, item) => sum + item.size, 0);
+    let doneBytes = 0;
+    let doneCount = 0;
+    onProgress('downloading', `Incremental Pull: ${changed.length} изменённых, ${deleted.length} удалённых`, 10);
+
+    if ((remote.fileTransferMode ?? 'agent') === 'ftp') {
+      if (!remote.ftp) { throw new Error('FTP настройки не заданы для этого remote.'); }
+      const ftpPassword = await this.getRemoteFtpPassword(remote.id);
+      await this.withFtpClient(remote.ftp, ftpPassword, async (client) => {
+        for (const entry of changed) {
+          const localFile = this.resolveLocalRel(localPath, entry.rel);
+          fs.mkdirSync(path.dirname(localFile), { recursive: true });
+          await this.downloadFtpFileResumable(client, this.ftpJoin(remote.ftp!.rootPath, entry.rel), localFile, entry, localPath, remote.id);
+          doneBytes += entry.size;
+          doneCount++;
+          onProgress('downloading', `Incremental Pull: ${doneCount}/${changed.length} файлов`, 10 + Math.round((doneBytes / Math.max(1, totalBytes)) * 80));
+        }
+      });
+    } else {
+      if (!appPassword) { throw new Error('Для incremental Pull через агент нужен WordPress Application Password.'); }
+      await this.assertIncrementalAgent(remote, appPassword);
+      for (const entry of changed) {
+        const buffer = await this.downloadAgentPath(remote, appPassword, entry.rel);
+        const localFile = this.resolveLocalRel(localPath, entry.rel);
+        fs.mkdirSync(path.dirname(localFile), { recursive: true });
+        fs.writeFileSync(localFile, buffer);
+        this.setLocalFileMtime(localFile, entry.mtimeMs);
+        doneBytes += entry.size;
+        doneCount++;
+        onProgress('downloading', `Incremental Pull: ${doneCount}/${changed.length} файлов`, 10 + Math.round((doneBytes / Math.max(1, totalBytes)) * 80));
+      }
+    }
+
+    for (const rel of deleted) {
+      const localFile = this.resolveLocalRel(localPath, rel);
+      try { if (fs.existsSync(localFile)) { fs.unlinkSync(localFile); } } catch (err) {
+        Logger.log(`[RemoteService] incremental pull delete local skipped rel=${rel}: ${this.formatShortError(err)}`);
+      }
+    }
+
+    await this.writeSyncState(localPath, remote.id, {
+      version: 1,
+      remoteId: remote.id,
+      updatedAt: new Date().toISOString(),
+      local: this.manifestMap(await this.listLocalManifest(localPath, false, skipUploads)),
+      remote: remoteMap,
+    });
+    Logger.log(`[RemoteService] incremental Pull done remote=${remote.name} changed=${changed.length} deleted=${deleted.length}`);
+  }
+
+  private async pushChangedFiles(
+    remote: RemoteSite,
+    localPath: string,
+    devMode: boolean,
+    onProgress: (phase: string, msg: string, pct?: number) => void,
+    appPassword?: string
+  ): Promise<void> {
+    onProgress('connecting', 'Проверка локальных изменений...', 5);
+    const localManifest = await this.listLocalManifest(localPath, devMode, false);
+    const localMap = this.manifestMap(localManifest);
+    const state = this.readSyncState(localPath, remote.id);
+    const baseline = state?.local ?? {};
+    const hasBaseline = Object.keys(baseline).length > 0;
+    const remoteManifest = await this.getRemoteFileManifest(remote, devMode, false, appPassword);
+    const remoteMap = this.manifestMap(remoteManifest);
+
+    const changed = localManifest.filter((entry) => {
+      const remoteEntry = remoteMap[entry.rel];
+      // Файла нет на сервере — загружаем всегда, даже если baseline говорит
+      // "не менялся": сервер могли очистить после последнего sync.
+      if (!remoteEntry) { return true; }
+      if (this.sameFileSig(entry, remoteEntry, false)) { return false; }
+      const previous = baseline[entry.rel];
+      if (hasBaseline) { return !previous || !this.sameFileSig(entry, previous); }
+      return true;
+    });
+    const deleted = hasBaseline
+      ? Object.keys(baseline).filter((rel) => !localMap[rel] && !!remoteMap[rel])
+      : [];
+
+    onProgress('uploading', `Incremental Push: ${changed.length} изменённых, ${deleted.length} удалённых`, 10);
+
+    if ((remote.fileTransferMode ?? 'agent') === 'ftp') {
+      if (!remote.ftp) { throw new Error('FTP настройки не заданы для этого remote.'); }
+      const ftpPassword = await this.getRemoteFtpPassword(remote.id);
+      await this.withFtpClient(remote.ftp, ftpPassword, async (client) => {
+        const totalBytes = changed.reduce((sum, item) => sum + item.size, 0);
+        let doneBytes = 0;
+        let doneCount = 0;
+        for (const entry of changed) {
+          const localFile = this.resolveLocalRel(localPath, entry.rel);
+          const remoteFile = this.ftpJoin(remote.ftp!.rootPath, entry.rel);
+          await client.ensureDir(path.posix.dirname(remoteFile));
+          await this.uploadFtpFileResumable(client, localFile, remoteFile, entry.size);
+          doneBytes += entry.size;
+          doneCount++;
+          onProgress('uploading', `Incremental FTP Push: ${doneCount}/${changed.length} файлов`, 10 + Math.round((doneBytes / Math.max(1, totalBytes)) * 75));
+        }
+        for (const rel of deleted) {
+          await client.remove(this.ftpJoin(remote.ftp!.rootPath, rel), true);
+        }
+      });
+    } else {
+      if (!appPassword) { throw new Error('Для incremental Push через агент нужен WordPress Application Password.'); }
+      await this.assertIncrementalAgent(remote, appPassword);
+      if (changed.length > 0) {
+        const archiver = (await import('archiver')).default;
+        const zipPath = path.join(os.tmpdir(), `wpdock-incremental-${Date.now()}.zip`);
+        try {
+          await this.createZipPart(localPath, zipPath, changed.map((entry) => ({
+            abs: this.resolveLocalRel(localPath, entry.rel),
+            rel: entry.rel,
+            size: entry.size,
+            mtimeMs: entry.mtimeMs,
+          })), archiver, devMode, true);
+          const token = await this.uploadToAgent(remote.url, appPassword, zipPath, (uploaded, total) => {
+            onProgress('uploading', `Incremental Push: ${this.formatBytes(uploaded)} / ${this.formatBytes(total)}`, 10 + Math.round((uploaded / Math.max(1, total)) * 60));
+          });
+          onProgress('extracting', 'Применение изменённых файлов на сервере...', 75);
+          await this.agentRequest(remote.url, appPassword, 'extract_files', { file_token: token }, AGENT_HEAVY_OP_TIMEOUT_MS);
+        } finally {
+          try { fs.unlinkSync(zipPath); } catch { /* ignore */ }
+        }
+      }
+      if (deleted.length > 0) {
+        onProgress('extracting', `Удаление файлов на сервере: ${deleted.length}`, 85);
+        await this.agentRequest(remote.url, appPassword, 'delete_paths', { paths: deleted }, AGENT_HEAVY_OP_TIMEOUT_MS);
+      }
+    }
+
+    await this.saveSyncStateFromRemote(remote, localPath, devMode, false, appPassword);
+    Logger.log(`[RemoteService] incremental Push done remote=${remote.name} changed=${changed.length} deleted=${deleted.length}`);
+  }
+
+  private async getRemoteFileManifest(
+    remote: RemoteSite,
+    devMode: boolean,
+    skipUploads: boolean,
+    appPassword?: string
+  ): Promise<FileManifestEntry[]> {
+    if ((remote.fileTransferMode ?? 'agent') === 'ftp') {
+      if (!remote.ftp) { throw new Error('FTP настройки не заданы для этого remote.'); }
+      const ftpPassword = await this.getRemoteFtpPassword(remote.id);
+      return this.withFtpClient(remote.ftp, ftpPassword, (client) => this.listFtpManifest(client, remote.ftp!, devMode, skipUploads));
+    }
+    if (!appPassword) { throw new Error('Для получения manifest через агент нужен WordPress Application Password.'); }
+    await this.assertIncrementalAgent(remote, appPassword);
+    const res = await this.agentRequest(remote.url, appPassword, 'file_manifest', {
+      dev_mode: devMode,
+      skip_uploads: skipUploads,
+    }, AGENT_HEAVY_OP_TIMEOUT_MS);
+    const token = String(res?.file_token || res?.token || '');
+    if (!token) { throw new Error('Агент не вернул manifest token.'); }
+    const buf = await this.downloadFromAgent(remote.url, appPassword, token);
+    return this.parseManifestBuffer(buf);
+  }
+
+  private async fetchAgentManifestMap(
+    siteUrl: string,
+    appPassword: string,
+    devMode: boolean
+  ): Promise<Record<string, FileManifestEntry>> {
+    const res = await this.agentRequest(siteUrl, appPassword, 'file_manifest', {
+      dev_mode: devMode,
+      skip_uploads: false,
+    }, AGENT_HEAVY_OP_TIMEOUT_MS);
+    const token = String(res?.file_token || res?.token || '');
+    if (!token) { throw new Error('Агент не вернул manifest token.'); }
+    const buf = await this.downloadFromAgent(siteUrl, appPassword, token);
+    return this.manifestMap(this.parseManifestBuffer(buf));
+  }
+
+  private findMissingOnRemote(entries: Array<{ rel: string }>, remoteMap: Record<string, FileManifestEntry>): string[] {
+    const missing: string[] = [];
+    for (const entry of entries) {
+      const rel = entry.rel.replace(/\\/g, '/').replace(/^\/+/, '');
+      const lower = rel.toLowerCase();
+      // Пути, которые серверный manifest фильтрует у себя, — не считаем пропавшими
+      if (lower === 'wp-content/wpdock-temp' || lower.startsWith('wp-content/wpdock-temp/')) { continue; }
+      if (rel.includes('\t') || rel.includes('\n')) { continue; }
+      if (!remoteMap[rel]) { missing.push(rel); }
+    }
+    return missing;
+  }
+
+  private async assertIncrementalAgent(remote: RemoteSite, appPassword: string): Promise<void> {
+    const version = await this.ensureAgent(remote, appPassword);
+    if (!version || this.compareSemver(version, INCREMENTAL_AGENT_VERSION) < 0) {
+      throw new Error(
+        `Для incremental sync через агент нужна версия WPDock Agent ${INCREMENTAL_AGENT_VERSION}+` +
+        `${version ? ` (сейчас ${version})` : ''}. Нажмите «Агент → Обновить» и повторите.`
+      );
+    }
+  }
+
+  private async downloadAgentPath(remote: RemoteSite, appPassword: string, rel: string): Promise<Buffer> {
+    const query = `action=download_path&path=${encodeURIComponent(rel)}`;
+    const { buffer, contentLength } = await this.streamDownload(remote.url, appPassword, query, `download_path rel=${rel}`);
+    if (contentLength > 0 && buffer.length !== contentLength) {
+      throw new Error(`Файл ${rel} скачан не полностью: ожидалось ${this.formatBytes(contentLength)}, получено ${this.formatBytes(buffer.length)}.`);
+    }
+    return buffer;
+  }
+
+  private async withFtpClient<T>(
+    config: RemoteFtpConfig,
+    password: string,
+    fn: (client: any) => Promise<T>
+  ): Promise<T> {
+    const { Client } = await import('basic-ftp');
+    const client = new Client(60 * 1000);
+    client.ftp.verbose = false;
+    try {
+      await client.access({
+        host: config.host,
+        port: config.port ?? (config.secure ? 21 : 21),
+        user: config.username,
+        password,
+        secure: config.secure ?? false,
+      });
+      return await fn(client);
+    } finally {
+      client.close();
+    }
+  }
+
+  private async listFtpManifest(
+    client: any,
+    config: RemoteFtpConfig,
+    devMode: boolean,
+    skipUploads: boolean
+  ): Promise<FileManifestEntry[]> {
+    const entries: FileManifestEntry[] = [];
+    const root = config.rootPath || '/';
+    const walk = async (relDir: string): Promise<void> => {
+      const remoteDir = relDir ? this.ftpJoin(root, relDir) : root;
+      let items: any[] = [];
+      try {
+        items = await client.list(remoteDir);
+      } catch (err) {
+        Logger.log(`[RemoteService] FTP list skipped dir=${remoteDir}: ${this.formatShortError(err)}`);
+        return;
+      }
+      for (const item of items) {
+        const name = String(item.name ?? '');
+        if (!name || name === '.' || name === '..') { continue; }
+        const rel = (relDir ? `${relDir}/${name}` : name).replace(/\\/g, '/');
+        const isDir = Boolean(item.isDirectory);
+        const isFile = Boolean(item.isFile);
+        if (this.shouldSkipHostingPath(rel, isDir, devMode, skipUploads)) { continue; }
+        if (isDir) {
+          await walk(rel);
+        } else if (isFile) {
+          entries.push({
+            rel,
+            size: Number(item.size || 0),
+            mtimeMs: item.modifiedAt instanceof Date ? item.modifiedAt.getTime() : 0,
+          });
+        }
+      }
+    };
+    await walk('');
+    entries.sort((a, b) => a.rel.localeCompare(b.rel));
+    return entries;
+  }
+
+  private async listLocalManifest(
+    localPath: string,
+    devMode: boolean,
+    skipUploads: boolean
+  ): Promise<FileManifestEntry[]> {
+    const entries: FileManifestEntry[] = [];
+    const root = path.resolve(localPath);
+    const stack = [{ abs: root, rel: '' }];
+    const seenDirs = new Set<string>([fs.realpathSync.native?.(root) ?? fs.realpathSync(root)]);
+
+    while (stack.length > 0) {
+      const current = stack.pop()!;
+      let items: fs.Dirent[];
+      try {
+        items = fs.readdirSync(current.abs, { withFileTypes: true });
+      } catch (err) {
+        Logger.log(`[RemoteService] local manifest skip unreadable dir=${current.abs}: ${this.formatShortError(err)}`);
+        continue;
+      }
+
+      for (const item of items) {
+        const rel = (current.rel ? `${current.rel}/${item.name}` : item.name).replace(/\\/g, '/');
+        const isDir = item.isDirectory();
+        if (this.shouldSkipHostingPath(rel, isDir, devMode, skipUploads)) { continue; }
+        const abs = path.join(current.abs, item.name);
+        let stat: fs.Stats;
+        try {
+          stat = fs.statSync(abs);
+        } catch {
+          continue;
+        }
+        if (stat.isDirectory()) {
+          let real = abs;
+          try { real = fs.realpathSync(abs); } catch { /* ignore */ }
+          if (seenDirs.has(real)) { continue; }
+          seenDirs.add(real);
+          stack.push({ abs, rel });
+        } else if (stat.isFile()) {
+          entries.push({ rel, size: stat.size, mtimeMs: Math.round(stat.mtimeMs) });
+        }
+      }
+    }
+    entries.sort((a, b) => a.rel.localeCompare(b.rel));
+    return entries;
+  }
+
+  private shouldSkipHostingPath(relPath: string, isDir: boolean, devMode: boolean, skipUploads: boolean): boolean {
+    const rel = relPath.replace(/\\/g, '/').replace(/^\/+/, '');
+    const lower = rel.toLowerCase();
+    if (skipUploads && (lower === 'wp-content/uploads' || lower.startsWith('wp-content/uploads/'))) {
+      return true;
+    }
+    return this.shouldSkipPushArchivePath(rel, isDir, devMode);
+  }
+
+  private manifestMap(entries: FileManifestEntry[]): Record<string, FileManifestEntry> {
+    const out: Record<string, FileManifestEntry> = {};
+    for (const entry of entries) {
+      out[entry.rel] = entry;
+    }
+    return out;
+  }
+
+  private sameFileSig(a?: FileManifestEntry, b?: FileManifestEntry, useMtime = true): boolean {
+    if (!a || !b) { return false; }
+    if (a.size !== b.size) { return false; }
+    if (!useMtime) { return true; }
+    if (!a.mtimeMs || !b.mtimeMs) { return true; }
+    return Math.abs(a.mtimeMs - b.mtimeMs) <= 2500;
+  }
+
+  private parseManifestBuffer(buf: Buffer): FileManifestEntry[] {
+    const entries: FileManifestEntry[] = [];
+    for (const line of buf.toString('utf8').split('\n')) {
+      if (!line.trim()) { continue; }
+      const parts = line.split('\t');
+      if (parts.length < 3) { continue; }
+      const rel = parts[0].replace(/\\/g, '/').replace(/^\/+/, '');
+      if (!rel || rel.includes('..')) { continue; }
+      entries.push({
+        rel,
+        size: Number(parts[1] || 0),
+        mtimeMs: Number(parts[2] || 0) * 1000,
+      });
+    }
+    entries.sort((a, b) => a.rel.localeCompare(b.rel));
+    return entries;
+  }
+
+  private syncStatePath(localPath: string, remoteId: string): string {
+    return path.join(localPath, '.wpdock', `hosting-sync-${remoteId}.json`);
+  }
+
+  private readSyncState(localPath: string, remoteId: string): HostingSyncState | undefined {
+    const file = this.syncStatePath(localPath, remoteId);
+    try {
+      if (!fs.existsSync(file)) { return undefined; }
+      const raw = JSON.parse(fs.readFileSync(file, 'utf8'));
+      if (raw?.version !== 1 || raw?.remoteId !== remoteId) { return undefined; }
+      return {
+        version: 1,
+        remoteId,
+        updatedAt: String(raw.updatedAt || ''),
+        local: raw.local && typeof raw.local === 'object' ? raw.local : {},
+        remote: raw.remote && typeof raw.remote === 'object' ? raw.remote : {},
+      };
+    } catch (err) {
+      Logger.log(`[RemoteService] read sync state failed: ${this.formatShortError(err)}`);
+      return undefined;
+    }
+  }
+
+  private async writeSyncState(localPath: string, remoteId: string, state: HostingSyncState): Promise<void> {
+    const file = this.syncStatePath(localPath, remoteId);
+    fs.mkdirSync(path.dirname(file), { recursive: true });
+    fs.writeFileSync(file, JSON.stringify(state, null, 2), 'utf8');
+  }
+
+  private transferStatePath(localPath: string, remoteId: string): string {
+    return path.join(localPath, '.wpdock', `transfer-state-${remoteId}.json`);
+  }
+
+  private readTransferState(localPath: string, remoteId: string): RemoteTransferState | undefined {
+    const file = this.transferStatePath(localPath, remoteId);
+    try {
+      if (!fs.existsSync(file)) { return undefined; }
+      const raw = JSON.parse(fs.readFileSync(file, 'utf8'));
+      if (raw?.version !== 1 || raw?.remoteId !== remoteId) { return undefined; }
+      const updatedAt = String(raw.updatedAt || '');
+      if (!this.isFreshIsoDate(updatedAt, TRANSFER_STATE_TTL_MS)) {
+        Logger.log(`[RemoteService] transfer state expired file=${file}`);
+        try { fs.unlinkSync(file); } catch { /* ignore */ }
+        return undefined;
+      }
+      return {
+        version: 1,
+        remoteId,
+        updatedAt,
+        pullPack: raw.pullPack && typeof raw.pullPack === 'object' ? raw.pullPack : undefined,
+        pushFiles: raw.pushFiles && typeof raw.pushFiles === 'object' ? raw.pushFiles : undefined,
+        ftpPull: raw.ftpPull && typeof raw.ftpPull === 'object' ? raw.ftpPull : undefined,
+      };
+    } catch (err) {
+      Logger.log(`[RemoteService] read transfer state failed: ${this.formatShortError(err)}`);
+      return undefined;
+    }
+  }
+
+  private writeTransferState(localPath: string, remoteId: string, state: RemoteTransferState): void {
+    const file = this.transferStatePath(localPath, remoteId);
+    state.updatedAt = new Date().toISOString();
+    fs.mkdirSync(path.dirname(file), { recursive: true });
+    fs.writeFileSync(file, JSON.stringify(state, null, 2), 'utf8');
+  }
+
+  private clearTransferState(localPath: string, remoteId: string): void {
+    try { fs.unlinkSync(this.transferStatePath(localPath, remoteId)); } catch { /* ignore */ }
+    try { fs.rmSync(path.join(localPath, '.wpdock', 'transfer-temp', remoteId), { recursive: true, force: true }); } catch { /* ignore */ }
+  }
+
+  /** Полный сброс локального состояния sync: resume-отметки Push/Pull и manifest последнего sync. */
+  resetSyncState(remoteId: string, localPath: string): { removed: string[] } {
+    const removed: string[] = [];
+    for (const file of [this.transferStatePath(localPath, remoteId), this.syncStatePath(localPath, remoteId)]) {
+      try {
+        if (fs.existsSync(file)) {
+          fs.unlinkSync(file);
+          removed.push(path.basename(file));
+        }
+      } catch (err) {
+        Logger.log(`[RemoteService] resetSyncState unlink failed file=${file}: ${this.formatShortError(err)}`);
+      }
+    }
+    try { fs.rmSync(path.join(localPath, '.wpdock', 'transfer-temp', remoteId), { recursive: true, force: true }); } catch { /* ignore */ }
+    Logger.log(`[RemoteService] resetSyncState remoteId=${remoteId} localPath=${localPath} removed=[${removed.join(', ')}]`);
+    return { removed };
+  }
+
+  private baseTransferState(remoteId: string): RemoteTransferState {
+    return { version: 1, remoteId, updatedAt: new Date().toISOString() };
+  }
+
+  private isFreshIsoDate(value: string, ttlMs: number): boolean {
+    const time = Date.parse(value);
+    return Number.isFinite(time) && Date.now() - time <= ttlMs;
+  }
+
+  private hashString(value: string): string {
+    return crypto.createHash('sha256').update(value).digest('hex');
+  }
+
+  private makePullPackKey(remote: RemoteSite, exclude: string[]): string {
+    return this.hashString(JSON.stringify({
+      url: this.normalizeBaseUrl(remote.url),
+      exclude: [...exclude].sort(),
+    }));
+  }
+
+  private makePushPlanKey(plan: PushArchivePlan, devMode: boolean): string {
+    return this.hashString(JSON.stringify({
+      devMode,
+      totalBytes: plan.totalBytes,
+      entries: plan.entries.map((entry) => ({
+        rel: entry.rel,
+        size: entry.size,
+        mtimeMs: entry.mtimeMs,
+      })),
+    }));
+  }
+
+  private makeManifestPlanKey(entries: FileManifestEntry[], options: object = {}): string {
+    return this.hashString(JSON.stringify({
+      ...options,
+      entries: entries.map((entry) => ({
+        rel: entry.rel,
+        size: entry.size,
+        mtimeMs: entry.mtimeMs,
+      })),
+    }));
+  }
+
+  private normalizeBaseUrl(url: string): string {
+    return String(url || '').trim().replace(/\/+$/, '').toLowerCase();
+  }
+
+  private ftpJoin(root: string, rel: string): string {
+    const cleanRoot = this.normalizeFtpRootPath(root || '/');
+    const cleanRel = rel.replace(/\\/g, '/').replace(/^\/+/, '');
+    if (!cleanRel) { return cleanRoot; }
+    return cleanRoot === '/' ? `/${cleanRel}` : `${cleanRoot}/${cleanRel}`;
+  }
+
+  private resolveLocalRel(root: string, rel: string): string {
+    const normalizedRoot = path.resolve(root);
+    const target = path.resolve(normalizedRoot, rel.replace(/\//g, path.sep));
+    if (!this.isPathInside(normalizedRoot, target)) {
+      throw new Error(`Небезопасный путь файла: ${rel}`);
+    }
+    return target;
+  }
+
+  private localFileManifestEntry(abs: string, rel: string): FileManifestEntry | undefined {
+    try {
+      if (!fs.existsSync(abs)) { return undefined; }
+      const stat = fs.statSync(abs);
+      if (!stat.isFile()) { return undefined; }
+      return { rel, size: stat.size, mtimeMs: Math.round(stat.mtimeMs) };
+    } catch {
+      return undefined;
+    }
+  }
+
+  private setLocalFileMtime(abs: string, mtimeMs: number): void {
+    if (!mtimeMs || !Number.isFinite(mtimeMs)) { return; }
+    try {
+      const mtime = new Date(mtimeMs);
+      fs.utimesSync(abs, mtime, mtime);
+    } catch (err) {
+      Logger.log(`[RemoteService] set mtime skipped path=${abs}: ${this.formatShortError(err)}`);
+    }
+  }
+
+  private localTransferTempPath(localRoot: string, remoteId: string, rel: string, kind: string): string {
+    const key = this.hashString(`${kind}:${rel}`);
+    return path.join(localRoot, '.wpdock', 'transfer-temp', remoteId, kind, `${key}.part`);
+  }
+
+  private async getFtpFileSize(client: any, remotePath: string): Promise<number | undefined> {
+    try {
+      const size = await client.size(remotePath);
+      return Number.isFinite(Number(size)) ? Number(size) : undefined;
+    } catch {
+      return undefined;
+    }
+  }
+
+  private async downloadFtpFileResumable(
+    client: any,
+    remoteFile: string,
+    localFile: string,
+    entry: FileManifestEntry,
+    localRoot: string,
+    remoteId: string
+  ): Promise<void> {
+    const tempFile = this.localTransferTempPath(localRoot, remoteId, entry.rel, 'ftp-pull');
+    fs.mkdirSync(path.dirname(tempFile), { recursive: true });
+    fs.mkdirSync(path.dirname(localFile), { recursive: true });
+
+    let startAt = fs.existsSync(tempFile) ? fs.statSync(tempFile).size : 0;
+    if (startAt > entry.size) {
+      fs.rmSync(tempFile, { force: true });
+      startAt = 0;
+    }
+
+    if (startAt < entry.size) {
+      Logger.log(`[RemoteService] FTP download ${startAt > 0 ? 'resume' : 'start'} rel=${entry.rel} from=${this.formatBytes(startAt)}/${this.formatBytes(entry.size)}`);
+      await client.downloadTo(tempFile, remoteFile, startAt);
+    } else if (!fs.existsSync(tempFile)) {
+      fs.closeSync(fs.openSync(tempFile, 'w'));
+    }
+
+    const finalSize = fs.existsSync(tempFile) ? fs.statSync(tempFile).size : 0;
+    if (finalSize !== entry.size) {
+      throw new Error(`FTP файл скачан не полностью: ${entry.rel}, ожидалось ${this.formatBytes(entry.size)}, получено ${this.formatBytes(finalSize)}.`);
+    }
+
+    try { fs.rmSync(localFile, { force: true }); } catch { /* ignore */ }
+    fs.renameSync(tempFile, localFile);
+    this.setLocalFileMtime(localFile, entry.mtimeMs);
+  }
+
+  private async uploadFtpFileResumable(
+    client: any,
+    localFile: string,
+    remoteFile: string,
+    totalBytes: number
+  ): Promise<void> {
+    const remoteDir = path.posix.dirname(remoteFile);
+    const remoteBase = path.posix.basename(remoteFile);
+    const tempRemote = this.ftpJoin(remoteDir, `.${remoteBase}.wpdock-upload`);
+
+    let remoteTempSize = await this.getFtpFileSize(client, tempRemote);
+    if (remoteTempSize !== undefined && remoteTempSize > totalBytes) {
+      try { await client.remove(tempRemote, true); } catch { /* ignore */ }
+      remoteTempSize = undefined;
+    }
+
+    const startAt = Math.max(0, remoteTempSize ?? 0);
+    if (startAt < totalBytes) {
+      Logger.log(`[RemoteService] FTP upload ${startAt > 0 ? 'resume' : 'start'} file=${path.basename(localFile)} from=${this.formatBytes(startAt)}/${this.formatBytes(totalBytes)}`);
+      if (startAt > 0) {
+        await client.appendFrom(localFile, tempRemote, { localStart: startAt });
+      } else {
+        await client.uploadFrom(localFile, tempRemote);
+      }
+    } else if (remoteTempSize === undefined) {
+      await client.uploadFrom(localFile, tempRemote);
+    }
+
+    const uploadedSize = await this.getFtpFileSize(client, tempRemote);
+    if (uploadedSize !== totalBytes) {
+      throw new Error(`FTP файл загружен не полностью: ${remoteFile}, ожидалось ${this.formatBytes(totalBytes)}, получено ${this.formatBytes(uploadedSize ?? 0)}.`);
+    }
+
+    await this.renameFtpOverwrite(client, tempRemote, remoteFile);
+  }
+
+  private async renameFtpOverwrite(client: any, src: string, dest: string): Promise<void> {
+    try {
+      await client.rename(src, dest);
+      return;
+    } catch {
+      // Some FTP servers refuse RNTO when the destination exists.
+    }
+    try { await client.remove(dest, true); } catch { /* ignore */ }
+    await client.rename(src, dest);
+  }
+
+  private async exportDatabaseViaFtpBridge(
+    remote: RemoteSite,
+    ftpPassword: string,
+    dbOutPath: string,
+    onProgress: (phase: string, msg: string, pct?: number) => void
+  ): Promise<void> {
+    if (!remote.ftp) { throw new Error('FTP настройки не заданы для этого remote.'); }
+    fs.mkdirSync(dbOutPath, { recursive: true });
+    onProgress('db', 'FTP DB bridge: загрузка временного PHP-файла...', 88);
+    const session = await this.withFtpClient(remote.ftp, ftpPassword, (client) => this.createFtpDbBridge(remote, client));
+    try {
+      onProgress('db', 'FTP DB bridge: экспорт базы данных...', 92);
+      const result = await this.callFtpDbBridge(session, 'export');
+      const outFile = path.join(dbOutPath, 'database.sql');
+
+      onProgress('db', 'FTP DB bridge: скачивание database.sql...', 96);
+      await this.withFtpClient(remote.ftp, ftpPassword, async (client) => {
+        await client.downloadTo(outFile, session.remoteSqlPath);
+      });
+
+      const sqlBuffer = fs.readFileSync(outFile);
+      this.assertValidSqlDump(sqlBuffer);
+      const meta = {
+        ...(result?.db_stats && typeof result.db_stats === 'object' ? result.db_stats : {}),
+        method: 'ftp-bridge',
+        fileSize: sqlBuffer.length,
+        exportedAt: new Date().toISOString(),
+      };
+      fs.writeFileSync(path.join(dbOutPath, 'database.meta.json'), JSON.stringify(meta, null, 2), 'utf-8');
+      onProgress('db', 'База данных экспортирована через FTP DB bridge', 98);
+    } finally {
+      await this.cleanupFtpDbBridge(remote, ftpPassword, session);
+    }
+  }
+
+  private async importDatabaseViaFtpBridge(
+    remote: RemoteSite,
+    ftpPassword: string,
+    sqlFile: string,
+    preserveCredentials: boolean,
+    onProgress: (phase: string, msg: string, pct?: number) => void
+  ): Promise<void> {
+    if (!remote.ftp) { throw new Error('FTP настройки не заданы для этого remote.'); }
+    if (!fs.existsSync(sqlFile)) {
+      Logger.log(`[RemoteService] FTP DB bridge import skipped: SQL file missing path=${sqlFile}`);
+      return;
+    }
+
+    onProgress('db', 'FTP DB bridge: загрузка временного PHP-файла...', 86);
+    const session = await this.withFtpClient(remote.ftp, ftpPassword, (client) => this.createFtpDbBridge(remote, client));
+    try {
+      onProgress('db', 'FTP DB bridge: загрузка database.sql...', 90);
+      await this.withFtpClient(remote.ftp, ftpPassword, async (client) => {
+        await client.ensureDir(path.posix.dirname(session.remoteSqlPath));
+        await client.uploadFrom(sqlFile, path.posix.basename(session.remoteSqlPath));
+      });
+
+      onProgress('db', 'FTP DB bridge: импорт базы данных на сервере...', 95);
+      await this.callFtpDbBridge(session, 'import', {
+        target_url: remote.url,
+        preserve_credentials: preserveCredentials,
+      });
+      onProgress('db', 'База данных импортирована через FTP DB bridge', 98);
+    } finally {
+      await this.cleanupFtpDbBridge(remote, ftpPassword, session);
+    }
+  }
+
+  private async createFtpDbBridge(remote: RemoteSite, client: any): Promise<FtpDbBridgeSession> {
+    if (!remote.ftp) { throw new Error('FTP настройки не заданы для этого remote.'); }
+    const id = crypto.randomBytes(12).toString('hex');
+    const secret = crypto.randomBytes(32).toString('hex');
+    const bridgeName = `wpdock-db-bridge-${id}.php`;
+    const sqlName = `wpdock-db-${id}.sql`;
+    const remoteBridgePath = this.ftpJoin(remote.ftp.rootPath, bridgeName);
+    const remoteSqlPath = this.ftpJoin(remote.ftp.rootPath, sqlName);
+    const bridgeUrl = `${remote.url.replace(/\/+$/, '')}/${encodeURIComponent(bridgeName)}`;
+    const tempFile = path.join(os.tmpdir(), bridgeName);
+
+    fs.writeFileSync(tempFile, this.buildFtpDbBridgePhp(secret, sqlName), { encoding: 'utf8', mode: 0o600 });
+    try {
+      await client.ensureDir(path.posix.dirname(remoteBridgePath));
+      await client.uploadFrom(tempFile, path.posix.basename(remoteBridgePath));
+    } finally {
+      try { fs.unlinkSync(tempFile); } catch { /* ignore */ }
+    }
+
+    Logger.log(`[RemoteService] FTP DB bridge uploaded url=${bridgeUrl} remote=${remote.name}`);
+    return { id, secret, bridgeName, sqlName, bridgeUrl, remoteBridgePath, remoteSqlPath };
+  }
+
+  private async cleanupFtpDbBridge(
+    remote: RemoteSite,
+    ftpPassword: string,
+    session: FtpDbBridgeSession
+  ): Promise<void> {
+    try {
+      await this.callFtpDbBridge(session, 'cleanup', {}, AGENT_REQUEST_TIMEOUT_MS);
+    } catch (err) {
+      Logger.log(`[RemoteService] FTP DB bridge HTTP cleanup skipped id=${session.id}: ${this.formatShortError(err)}`);
+    }
+    if (!remote.ftp) { return; }
+    try {
+      await this.withFtpClient(remote.ftp, ftpPassword, async (client) => {
+        for (const remotePath of [session.remoteSqlPath, session.remoteBridgePath]) {
+          try {
+            await client.remove(remotePath);
+          } catch {
+            // The HTTP cleanup may already have removed the file.
+          }
+        }
+      });
+    } catch (err) {
+      Logger.log(`[RemoteService] FTP DB bridge FTP cleanup failed id=${session.id}: ${this.formatShortError(err)}`);
+    }
+  }
+
+  private async callFtpDbBridge(
+    session: FtpDbBridgeSession,
+    action: 'export' | 'import' | 'cleanup',
+    body: object = {},
+    timeoutMs: number = AGENT_HEAVY_OP_TIMEOUT_MS
+  ): Promise<any> {
+    const fetch = (await import('node-fetch')).default;
+    const url = `${session.bridgeUrl}?action=${encodeURIComponent(action)}&token=${encodeURIComponent(session.secret)}`;
+    const started = Date.now();
+    Logger.log(`[RemoteService] FTP DB bridge request START action=${action} id=${session.id}`);
+    const res = await fetch(url, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'X-WPDock-DB-Token': session.secret,
+      },
+      body: JSON.stringify(body),
+      signal: this.createTimeoutSignal(timeoutMs),
+    });
+    const text = await res.text();
+    let data: any;
+    try {
+      data = JSON.parse(text);
+    } catch {
+      throw new Error(`FTP DB bridge вернул не JSON (${res.status}): ${text.slice(0, 500)}`);
+    }
+    const duration = Date.now() - started;
+    if (!res.ok || !data?.success) {
+      Logger.log(`[RemoteService] FTP DB bridge request FAILED action=${action} id=${session.id} status=${res.status} duration=${duration}ms message=${data?.message || text}`);
+      throw new Error(data?.message || `FTP DB bridge error ${res.status}`);
+    }
+    Logger.log(`[RemoteService] FTP DB bridge request SUCCESS action=${action} id=${session.id} duration=${duration}ms`);
+    return data.data;
+  }
+
+  private buildFtpDbBridgePhp(secret: string, sqlName: string): string {
+    if (!/^[a-f0-9]{64}$/.test(secret) || !/^wpdock-db-[a-f0-9]{24}\.sql$/.test(sqlName)) {
+      throw new Error('Некорректные параметры FTP DB bridge.');
+    }
+    const templatePath = path.join(this.context.extensionPath, 'resources', 'ftp-db-bridge.php');
+    const template = fs.readFileSync(templatePath, 'utf8');
+    return template
+      .split('__WPDOCK_SECRET__').join(secret)
+      .split('__WPDOCK_SQL_NAME__').join(sqlName);
+  }
+
+  private async exportDatabaseToLocal(
+    remote: RemoteSite,
+    appPassword: string,
+    dbOutPath: string,
+    onProgress: (phase: string, msg: string, pct?: number) => void
+  ): Promise<void> {
+    onProgress('db', 'Экспорт базы данных...', 90);
+    await this.ensureAgent(remote, appPassword);
+    const dbResult = await this.agentRequest(remote.url, appPassword, 'export_db', {}, AGENT_HEAVY_OP_TIMEOUT_MS);
+    const sqlBuffer = await this.downloadFromAgent(remote.url, appPassword, dbResult.file_token);
+    this.assertValidSqlDump(sqlBuffer);
+    fs.writeFileSync(path.join(dbOutPath, 'database.sql'), sqlBuffer);
+    if (dbResult?.db_stats) {
+      fs.writeFileSync(path.join(dbOutPath, 'database.meta.json'), JSON.stringify(dbResult.db_stats, null, 2), 'utf-8');
+    }
+    onProgress('db', 'База данных экспортирована в database.sql', 96);
+  }
+
+  private async importDatabaseFromLocal(
+    remote: RemoteSite,
+    appPassword: string,
+    sqlFile: string,
+    preserveCredentials: boolean,
+    onProgress: (phase: string, msg: string, pct?: number) => void
+  ): Promise<void> {
+    if (!fs.existsSync(sqlFile)) {
+      Logger.log(`[RemoteService] FTP/import DB skipped: SQL file missing path=${sqlFile}`);
+      return;
+    }
+    await this.ensureAgent(remote, appPassword);
+    onProgress('db', 'Загрузка базы данных...', 88);
+    const dbToken = await this.uploadToAgent(remote.url, appPassword, sqlFile);
+    onProgress('db', 'Импорт базы данных на сервере...', 94);
+    await this.agentRequest(remote.url, appPassword, 'import_db', {
+      file_token: dbToken,
+      target_url: remote.url,
+      preserve_credentials: preserveCredentials,
+    }, AGENT_HEAVY_OP_TIMEOUT_MS);
+  }
+
+  private async saveSyncStateFromManifests(
+    remoteId: string,
+    localPath: string,
+    remoteManifest: FileManifestEntry[]
+  ): Promise<void> {
+    await this.writeSyncState(localPath, remoteId, {
+      version: 1,
+      remoteId,
+      updatedAt: new Date().toISOString(),
+      local: this.manifestMap(await this.listLocalManifest(localPath, false, false)),
+      remote: this.manifestMap(remoteManifest),
+    });
+  }
+
+  private async saveSyncStateFromRemote(
+    remote: RemoteSite,
+    localPath: string,
+    devMode: boolean,
+    skipUploads: boolean,
+    appPassword?: string
+  ): Promise<void> {
+    const [localManifest, remoteManifest] = await Promise.all([
+      this.listLocalManifest(localPath, devMode, skipUploads),
+      this.getRemoteFileManifest(remote, devMode, skipUploads, appPassword).catch((err) => {
+        Logger.log(`[RemoteService] saveSyncState remote manifest fallback: ${this.formatShortError(err)}`);
+        return [] as FileManifestEntry[];
+      }),
+    ]);
+    await this.writeSyncState(localPath, remote.id, {
+      version: 1,
+      remoteId: remote.id,
+      updatedAt: new Date().toISOString(),
+      local: this.manifestMap(localManifest),
+      remote: this.manifestMap(remoteManifest),
+    });
   }
 
   // ── Helpers ───────────────────────────────────────────────────────────────
@@ -1900,6 +3431,27 @@ if (!defined('ABSPATH')) { exit; }
     return { remote, appPassword };
   }
 
+  private async getRemoteWithOptionalPass(
+    remoteId: string
+  ): Promise<{ remote: RemoteSite; appPassword?: string }> {
+    const remote = this.getRemote(remoteId);
+    if (!remote) {throw new Error(`Удаленный сайт ${remoteId} не найден`);}
+    const storedAppPassword = await this.storage.getSecret(`remote-${remoteId}-pass`);
+    const appPassword = this.normalizeAppPassword(storedAppPassword || '');
+    if (storedAppPassword && storedAppPassword !== appPassword) {
+      await this.storage.saveSecret(`remote-${remoteId}-pass`, appPassword);
+    }
+    return { remote, appPassword: appPassword || undefined };
+  }
+
+  private async getRemoteFtpPassword(remoteId: string): Promise<string> {
+    const password = await this.storage.getSecret(`remote-${remoteId}-ftp-pass`);
+    if (!password) {
+      throw new Error('FTP пароль не найден. Откройте настройки remote и укажите FTP пароль заново.');
+    }
+    return password;
+  }
+
   /** Ensures the agent is reachable and returns its reported version (or undefined). */
   private async ensureAgent(remote: RemoteSite, appPassword: string): Promise<string | undefined> {
     Logger.log(`[RemoteService] ensureAgent start remote=${remote.name} id=${remote.id} flagInstalled=${remote.agentInstalled}`);
@@ -1907,6 +3459,7 @@ if (!defined('ABSPATH')) { exit; }
     try {
       const ping = await this.agentRequest(remote.url, appPassword, 'ping', {});
       this.assertSupportedAgentVersion(ping?.version);
+      this.assertAgentTempWritable(ping, remote);
       if (!remote.agentInstalled) {
         remote.agentInstalled = true;
         this.storage.saveRemote(remote);
@@ -1914,7 +3467,8 @@ if (!defined('ABSPATH')) { exit; }
       Logger.log(`[RemoteService] ensureAgent ping OK remote=${remote.name} id=${remote.id}`);
       const live = ping?.version ? String(ping.version) : undefined;
       return await this.maybeAutoUpdateAgent(remote, appPassword, live);
-    } catch {
+    } catch (err) {
+      if (err instanceof AgentTempUnwritableError) { throw err; }
       // Continue with token registration / plugin checks.
       Logger.log(`[RemoteService] ensureAgent ping failed, continue remote=${remote.name} id=${remote.id}`);
     }
@@ -1924,11 +3478,14 @@ if (!defined('ABSPATH')) { exit; }
       await this.registerAgentToken(remote.url, remote.username, appPassword, token);
       const ping = await this.agentRequest(remote.url, appPassword, 'ping', {});
       this.assertSupportedAgentVersion(ping?.version);
+      this.assertAgentTempWritable(ping, remote);
       remote.agentInstalled = true;
       this.storage.saveRemote(remote);
       Logger.log(`[RemoteService] ensureAgent register-token + ping OK remote=${remote.name} id=${remote.id}`);
-      return ping?.version ? String(ping.version) : undefined;
-    } catch {
+      const live = ping?.version ? String(ping.version) : undefined;
+      return await this.maybeAutoUpdateAgent(remote, appPassword, live);
+    } catch (err) {
+      if (err instanceof AgentTempUnwritableError) { throw err; }
       // Continue with plugin inspection and activation below.
       Logger.log(`[RemoteService] ensureAgent register-token path failed, continue remote=${remote.name} id=${remote.id}`);
     }
@@ -1936,7 +3493,8 @@ if (!defined('ABSPATH')) { exit; }
     const status = await this.checkAgent(remote.id);
     if (status.responsive) {
       Logger.log(`[RemoteService] ensureAgent checkAgent resolved responsiveness remote=${remote.name} id=${remote.id}`);
-      return this.getAgentVersionIfResponsive(remote.url, appPassword);
+      const live = await this.getAgentVersionIfResponsive(remote.url, appPassword);
+      return await this.maybeAutoUpdateAgent(remote, appPassword, live);
     }
 
     remote.agentInstalled = false;
@@ -1944,6 +3502,7 @@ if (!defined('ABSPATH')) { exit; }
     Logger.log(`[RemoteService] ensureAgent fallback reinstall start remote=${remote.name} id=${remote.id}`);
     await this.installAgent(remote.id);
     const finalPing = await this.agentRequest(remote.url, appPassword, 'ping', {});
+    this.assertAgentTempWritable(finalPing, remote);
     Logger.log(`[RemoteService] ensureAgent fallback reinstall success remote=${remote.name} id=${remote.id}`);
     const finalVersion = finalPing?.version ? String(finalPing.version) : undefined;
     return await this.maybeAutoUpdateAgent(remote, appPassword, finalVersion);
@@ -1973,6 +3532,46 @@ if (!defined('ABSPATH')) { exit; }
       Logger.log(`[RemoteService] ensureAgent auto-update failed (keeping ${liveVersion}): ${this.formatShortError(err)}`);
       return liveVersion;
     }
+  }
+
+  private normalizeFtpConfig(raw?: (RemoteFtpConfig & { password?: string }) | null): RemoteFtpConfig | undefined {
+    if (!raw) { return undefined; }
+    const host = String(raw.host ?? '').trim();
+    const username = String(raw.username ?? '').trim();
+    const rootPath = this.normalizeFtpRootPath(String(raw.rootPath ?? '/'));
+    const port = Number.isFinite(raw.port) ? Math.round(Number(raw.port)) : undefined;
+    if (!host && !username && rootPath === '/') { return undefined; }
+    if (!host) { throw new Error('FTP host не может быть пустым'); }
+    if (!username) { throw new Error('FTP логин не может быть пустым'); }
+    if (port !== undefined && (port < 1 || port > 65535)) {
+      throw new Error('FTP порт должен быть от 1 до 65535');
+    }
+    return {
+      host,
+      username,
+      rootPath,
+      port,
+      secure: Boolean(raw.secure),
+    };
+  }
+
+  private normalizeFtpRootPath(value: string): string {
+    const trimmed = value.trim().replace(/\\/g, '/').replace(/\/{2,}/g, '/');
+    if (!trimmed || trimmed === '.') { return '/'; }
+    return trimmed.startsWith('/') ? trimmed.replace(/\/+$/, '') || '/' : trimmed.replace(/\/+$/, '') || '/';
+  }
+
+  private async verifyFtpConnection(config: RemoteFtpConfig, password: string): Promise<void> {
+    await this.withFtpClient(config, password, async (client) => {
+      await client.cd(config.rootPath || '/');
+      // Make sure this is probably a WordPress root, but don't be too strict:
+      // some hosts hide dotfiles or use custom layouts.
+      const list = await client.list();
+      const names = new Set(list.map((item: any) => String(item.name).toLowerCase()));
+      if (!names.has('wp-content') && !names.has('wp-admin') && !names.has('wp-includes')) {
+        Logger.log(`[RemoteService] FTP root ${config.rootPath} does not look like WP root (wp-content/wp-admin not listed), accepting anyway`);
+      }
+    });
   }
 
   private async verifyCredentials(
@@ -2669,6 +4268,7 @@ if (!defined('ABSPATH')) { exit; }
     onProgress: (phase: string, msg: string, pct?: number) => void,
     basePct: number,
     rangePct: number,
+    agentVersion?: string,
   ): Promise<{ total: number; downloaded: number; bytes: number; failed: number }> {
     const curl = RemoteService.curlPath();
     if (!curl) {
@@ -2756,6 +4356,9 @@ if (!defined('ABSPATH')) { exit; }
     // failure only re-checks a small slice (everything else stays on disk).
     const CHUNK = 1200;
     const parallel = RemoteService.curlSupportsParallel();
+    const canFallbackToAgentPath = Boolean(
+      agentVersion && this.compareSemver(agentVersion, INCREMENTAL_AGENT_VERSION) >= 0
+    );
     const failures: string[] = [];
     for (let i = 0; i < pending.length; i += CHUNK) {
       const chunk = pending.slice(i, i + CHUNK);
@@ -2778,26 +4381,37 @@ if (!defined('ABSPATH')) { exit; }
         onProgress('media', `Медиа: ${liveCount}/${entries.length} файлов (${this.formatBytes(liveBytes)})`, pct);
       };
       let remaining = chunk;
-      for (let attempt = 1; attempt <= 3 && remaining.length > 0; attempt++) {
-        if (attempt > 1) {
-          // Clear unresumable partials so each retry starts these files fresh.
-          for (const e of remaining) { try { fs.unlinkSync(e.out); } catch { /* ignore */ } }
-          await new Promise((r) => setTimeout(r, 1500 * attempt));
+      if (canFallbackToAgentPath && remaining.length <= 8) {
+        remaining = await this.downloadMediaLeftoversViaAgent(remote, appPassword, remaining);
+      } else {
+        for (let attempt = 1; attempt <= 3 && remaining.length > 0; attempt++) {
+          if (attempt > 1) {
+            // Clear unresumable partials so each retry starts these files fresh.
+            for (const e of remaining) { try { fs.unlinkSync(e.out); } catch { /* ignore */ } }
+            await new Promise((r) => setTimeout(r, 1500 * attempt));
+          }
+          try {
+            await this.curlDownloadBatch(curl, contentBaseUrl, remaining, parallel, 8, liveReport);
+          } catch (err) {
+            // A non-zero curl exit just means SOME file in the batch failed; the
+            // rest still landed on disk. Re-verify below to find what's left.
+            Logger.log(`[RemoteService] pullUploadsDirect batch curl error attempt=${attempt}: ${this.formatShortError(err)}`);
+          }
+          const next: typeof remaining = [];
+          for (const e of remaining) {
+            let onDisk = -1;
+            try { onDisk = fs.statSync(e.out).size; } catch { /* missing */ }
+            if (onDisk !== e.size) { next.push(e); }
+          }
+          remaining = next;
+          if (canFallbackToAgentPath && remaining.length > 0 && remaining.length <= 8) {
+            Logger.log(`[RemoteService] pullUploadsDirect switching ${remaining.length} leftover file(s) to agent fallback`);
+            break;
+          }
         }
-        try {
-          await this.curlDownloadBatch(curl, contentBaseUrl, remaining, parallel, 8, liveReport);
-        } catch (err) {
-          // A non-zero curl exit just means SOME file in the batch failed; the
-          // rest still landed on disk. Re-verify below to find what's left.
-          Logger.log(`[RemoteService] pullUploadsDirect batch curl error attempt=${attempt}: ${this.formatShortError(err)}`);
+        if (remaining.length > 0 && canFallbackToAgentPath) {
+          remaining = await this.downloadMediaLeftoversViaAgent(remote, appPassword, remaining);
         }
-        const next: typeof remaining = [];
-        for (const e of remaining) {
-          let onDisk = -1;
-          try { onDisk = fs.statSync(e.out).size; } catch { /* missing */ }
-          if (onDisk !== e.size) { next.push(e); }
-        }
-        remaining = next;
       }
       for (const e of chunk) {
         if (!remaining.includes(e)) { doneCount++; doneBytes += e.size; }
@@ -2814,6 +4428,36 @@ if (!defined('ABSPATH')) { exit; }
       onProgress('media', `Медиа перенесены: ${doneCount} файлов (${this.formatBytes(doneBytes)})`, basePct + rangePct);
     }
     return { total: entries.length, downloaded: doneCount, bytes: doneBytes, failed: failures.length };
+  }
+
+  private async downloadMediaLeftoversViaAgent(
+    remote: RemoteSite,
+    appPassword: string,
+    files: Array<{ rel: string; size: number; out: string }>
+  ): Promise<Array<{ rel: string; size: number; out: string }>> {
+    // Some upload paths are listed in the media manifest but are not actually
+    // fetchable as static public files (e.g. plugin backup folders protected by
+    // .htaccess). Direct curl can sit until the idle watchdog for each retry.
+    // Agent 1.3.13+ can stream a single root-relative file safely, so use it as a
+    // slow-path fallback for the few leftovers.
+    Logger.log(`[RemoteService] pullUploadsDirect agent fallback for ${files.length} leftover media file(s)`);
+    const stillRemaining: Array<{ rel: string; size: number; out: string }> = [];
+    for (const e of files) {
+      try {
+        const rootRel = `wp-content/${e.rel.replace(/^\/+/, '')}`;
+        const buf = await this.downloadAgentPath(remote, appPassword, rootRel);
+        if (buf.length !== e.size) {
+          throw new Error(`size mismatch: expected ${this.formatBytes(e.size)}, got ${this.formatBytes(buf.length)}`);
+        }
+        await fs.promises.mkdir(path.dirname(e.out), { recursive: true });
+        await fs.promises.writeFile(e.out, buf);
+        Logger.log(`[RemoteService] pullUploadsDirect agent fallback OK rel=${e.rel} size=${this.formatBytes(buf.length)}`);
+      } catch (err) {
+        Logger.log(`[RemoteService] pullUploadsDirect agent fallback failed rel=${e.rel} error=${this.formatShortError(err)}`);
+        stillRemaining.push(e);
+      }
+    }
+    return stillRemaining;
   }
 
   /**
@@ -2875,7 +4519,6 @@ if (!defined('ABSPATH')) { exit; }
       let stalled = false;
       let lastBytes = sampleBytes();
       let lastProgressAt = Date.now();
-      let proc: cp.ChildProcess;
       // Watchdog: while curl runs with no parseable progress, watch the bytes it
       // writes to disk. Growth ⇒ re-arm; flatline past the idle window ⇒ a silently
       // stalled socket — kill curl so the caller's retry/resume runs (vs. hanging
@@ -2893,7 +4536,7 @@ if (!defined('ABSPATH')) { exit; }
         try { onTick?.(); } catch { /* progress reporting must never break the download */ }
       }, MEDIA_DOWNLOAD_SAMPLE_MS);
 
-      proc = cp.execFile(
+      const proc = cp.execFile(
         curl, args,
         { timeout: AGENT_HEAVY_OP_TIMEOUT_MS, maxBuffer: 16 * 1024 * 1024 },
         (err, _stdout, stderr) => {
@@ -3100,6 +4743,25 @@ if (!defined('ABSPATH')) { exit; }
     }
   }
 
+  /** Agent ≥1.3.17 reports a real write probe of wp-content/wpdock-temp in
+   *  ping. Older agents omit the field — then no check. `is_writable`/
+   *  `disk_free_space` on the server can't see a hosting quota, so only this
+   *  probe catches «диск переполнен» before minutes of packing. */
+  private assertAgentTempWritable(ping: any, remote: RemoteSite): void {
+    if (!ping || ping.temp_writable !== false) {
+      return;
+    }
+    const reason = ping.temp_write_error ? ` (${String(ping.temp_write_error)})` : '';
+    const free = typeof ping.temp_free_bytes === 'number'
+      ? ` disk_free_space раздела: ${this.formatBytes(ping.temp_free_bytes)} — квота аккаунта может быть исчерпана раньше.`
+      : '';
+    throw new AgentTempUnwritableError(
+      `Сервер «${remote.name}» не может записывать во временную папку wp-content/wpdock-temp${reason}. ` +
+      `Обычно это переполненный диск или превышенная квота хостинга: очистите wp-content/wpdock-temp ` +
+      `(старые upload-*.zip от прежних попыток Push) и проверьте свободное место.${free}`
+    );
+  }
+
   private compareSemver(a: string, b: string): number {
     const pa = a.split('.').map((part) => Number.parseInt(part, 10) || 0);
     const pb = b.split('.').map((part) => Number.parseInt(part, 10) || 0);
@@ -3238,18 +4900,68 @@ if (!defined('ABSPATH')) { exit; }
     totalBytes: number,
     onProgress?: (uploadedBytes: number, totalBytes: number) => void
   ): Promise<string> {
+    Logger.log(`[RemoteService] uploadToAgentChunked hashing file=${path.basename(filePath)} size=${this.formatBytes(totalBytes)} for resumable upload`);
+    const fileHash = await this.hashFile(filePath);
+    const resumeKey = this.makeUploadResumeKey(fileHash, totalBytes, path.extname(filePath));
     // Start with the configured chunk size (can be large for capable hosts). If the
     // host rejects an oversized POST body (413), halve and re-run the session rather
     // than failing the whole Push — this makes a high chunk-size setting safe.
+    //
+    // New agents normally assemble resumable uploads directly into one file by
+    // offset writes (low disk usage). Some shared hosts intermittently fail those
+    // writes even after concurrency drops to 1. In that case fall back to the older
+    // per-chunk-files assembly for this archive part: it needs more temporary space
+    // for one split part, but avoids sparse/offset writes and keeps the Push moving.
     let chunkSize = CHUNK_UPLOAD_BYTES;
-    while (true) {
+    let sessionRetries = 0;
+    let writeMode: AgentUploadWriteMode = 'single_file';
+    for (;;) {
       try {
-        return await this.runChunkedUploadSession(siteUrl, appPassword, filePath, totalBytes, chunkSize, onProgress);
+        return await this.runChunkedUploadSession(siteUrl, appPassword, filePath, totalBytes, chunkSize, resumeKey, writeMode, onProgress);
       } catch (err) {
         if (this.isChunkSizeRejection(err) && chunkSize > MIN_CHUNK_UPLOAD_BYTES) {
           const reduced = Math.max(MIN_CHUNK_UPLOAD_BYTES, Math.floor(chunkSize / 2));
           Logger.log(`[RemoteService] uploadToAgentChunked host rejected chunkSize=${this.formatBytes(chunkSize)} (413) — retrying with ${this.formatBytes(reduced)}`);
           chunkSize = reduced;
+          sessionRetries = 0;
+          continue;
+        }
+        if (
+          this.isTransientChunkWriteError(err) &&
+          writeMode === 'single_file' &&
+          this.getEffectiveUploadConcurrency() <= MIN_ADAPTIVE_UPLOAD_CONCURRENCY
+        ) {
+          writeMode = 'chunks';
+          sessionRetries = 0;
+          Logger.log(
+            `[RemoteService] uploadToAgentChunked persistent single-file chunk write failure at concurrency=1 — ` +
+            `retrying ${path.basename(filePath)} with chunk-file assembly`
+          );
+          continue;
+        }
+        // The server-side upload session expired or was lost mid-transfer (410/404).
+        // A fresh runChunkedUploadSession re-runs upload_init. New agents resume
+        // by resume_key; if the server already deleted the expired session, this
+        // safely starts a new one. Bounded so repeated drops surface the error.
+        if (this.isUploadSessionExpired(err) && sessionRetries < UPLOAD_SESSION_RETRY_COUNT) {
+          sessionRetries++;
+          Logger.log(`[RemoteService] uploadToAgentChunked upload session expired/lost — re-initializing (attempt ${sessionRetries}/${UPLOAD_SESSION_RETRY_COUNT})`);
+          continue;
+        }
+        if (this.isRetryableUploadError(err) && sessionRetries < UPLOAD_SESSION_RETRY_COUNT) {
+          sessionRetries++;
+          this.reduceAdaptiveUploadConcurrency(`session transient ${this.formatShortError(err)}`);
+          Logger.log(`[RemoteService] uploadToAgentChunked transient failure — re-initializing/resuming upload session (attempt ${sessionRetries}/${UPLOAD_SESSION_RETRY_COUNT}) error=${this.formatShortError(err)}`);
+          continue;
+        }
+        if (this.isTransientChunkWriteError(err) && chunkSize > MIN_CHUNK_UPLOAD_BYTES) {
+          const reduced = Math.max(MIN_CHUNK_UPLOAD_BYTES, Math.floor(chunkSize / 2));
+          chunkSize = reduced;
+          sessionRetries = 0;
+          Logger.log(
+            `[RemoteService] uploadToAgentChunked persistent chunk write failure — ` +
+            `retrying ${path.basename(filePath)} with smaller chunkSize=${this.formatBytes(reduced)}`
+          );
           continue;
         }
         throw err;
@@ -3263,35 +4975,85 @@ if (!defined('ABSPATH')) { exit; }
     filePath: string,
     totalBytes: number,
     chunkSize: number,
+    resumeKey: string,
+    writeMode: AgentUploadWriteMode,
     onProgress?: (uploadedBytes: number, totalBytes: number) => void
   ): Promise<string> {
     const filename = path.basename(filePath);
     const totalChunks = Math.max(1, Math.ceil(totalBytes / chunkSize));
-    Logger.log(`[RemoteService] runChunkedUploadSession START file=${filename} totalChunks=${totalChunks} chunkSize=${this.formatBytes(chunkSize)} concurrency=${CHUNK_UPLOAD_CONCURRENCY} totalSize=${this.formatBytes(totalBytes)}`);
+    const configuredConcurrency = this.normalizeConcurrency(CHUNK_UPLOAD_CONCURRENCY);
+    const effectiveConcurrency = this.getEffectiveUploadConcurrency();
+    const workerCount = Math.min(effectiveConcurrency, totalChunks);
+    const adaptiveSuffix = effectiveConcurrency < configuredConcurrency
+      ? ` adaptiveCap=${effectiveConcurrency} configured=${configuredConcurrency}`
+      : '';
+    Logger.log(`[RemoteService] runChunkedUploadSession START file=${filename} totalChunks=${totalChunks} chunkSize=${this.formatBytes(chunkSize)} concurrency=${workerCount}${adaptiveSuffix} writeMode=${writeMode} totalSize=${this.formatBytes(totalBytes)}`);
     const init = await this.agentRequest(siteUrl, appPassword, 'upload_init', {
       filename,
       total_chunks: totalChunks,
-    });
+      total_bytes: totalBytes,
+      chunk_size: chunkSize,
+      concurrency: workerCount,
+      resume_key: resumeKey,
+      write_mode: writeMode,
+    }, AGENT_UPLOAD_CONTROL_TIMEOUT_MS);
+
+    const completedToken = String(init?.file_token || '');
+    if (completedToken) {
+      Logger.log(`[RemoteService] runChunkedUploadSession RESUME completed upload file=${filename} token=${completedToken}`);
+      onProgress?.(totalBytes, totalBytes);
+      return completedToken;
+    }
 
     const uploadId = String(init?.upload_id || '');
     if (!uploadId) {
       throw new Error('Agent did not return upload_id for chunked upload');
     }
 
-    const fileHandle = await fs.promises.open(filePath, 'r');
+    const receivedIndices = new Set<number>(
+      Array.isArray(init?.received_indices)
+        ? init.received_indices
+          .map((value: unknown) => Number(value))
+          .filter((value: number) => Number.isInteger(value) && value >= 0 && value < totalChunks)
+        : []
+    );
     let uploadedBytes = 0;
+    for (const index of receivedIndices) {
+      const start = index * chunkSize;
+      const remaining = Math.max(0, totalBytes - start);
+      uploadedBytes += Math.min(chunkSize, remaining);
+    }
+    uploadedBytes = Math.min(uploadedBytes, totalBytes);
+    if (receivedIndices.size > 0 || init?.resumed) {
+      Logger.log(
+        `[RemoteService] runChunkedUploadSession RESUME uploadId=${uploadId} ` +
+        `received=${receivedIndices.size}/${totalChunks} uploaded=${this.formatBytes(uploadedBytes)}`
+      );
+      onProgress?.(uploadedBytes, totalBytes);
+    }
+
+    const fileHandle = await fs.promises.open(filePath, 'r');
     let nextChunkIndex = 0;
     // When one worker fails, the others stop pulling new chunks so we surface the
     // error fast (e.g. a 413) instead of letting every worker exhaust its retries.
     let aborted = false;
+    // Set when any worker sees a genuine 413. Under concurrency the error that wins
+    // the Promise.all race is often a connection reset (nginx drops the socket on an
+    // oversized body) rather than a clean 413, which would hide the real cause from
+    // the chunk-size auto-reduction in uploadToAgentChunked. This flag lets us
+    // re-surface it as a payload-limit error regardless of which error rejected first.
+    let sawPayloadLimit = false;
+    let transientChunkRetries = 0;
 
     try {
-      const workerCount = Math.min(CHUNK_UPLOAD_CONCURRENCY, totalChunks);
       const workers = Array.from({ length: workerCount }, async () => {
         while (nextChunkIndex < totalChunks && !aborted) {
           const currentIndex = nextChunkIndex++;
           if (currentIndex >= totalChunks) {
             return;
+          }
+          if (receivedIndices.has(currentIndex)) {
+            continue;
           }
 
           const start = currentIndex * chunkSize;
@@ -3304,7 +5066,7 @@ if (!defined('ABSPATH')) { exit; }
             : buffer.subarray(0, readResult.bytesRead);
 
           try {
-            await this.uploadChunkToAgent(
+            const retriesUsed = await this.uploadChunkToAgent(
               siteUrl,
               appPassword,
               uploadId,
@@ -3312,8 +5074,10 @@ if (!defined('ABSPATH')) { exit; }
               filename,
               chunkBuffer
             );
+            transientChunkRetries += retriesUsed;
           } catch (err) {
             aborted = true;
+            if (this.isChunkSizeRejection(err)) { sawPayloadLimit = true; }
             throw err;
           }
 
@@ -3323,13 +5087,37 @@ if (!defined('ABSPATH')) { exit; }
       });
 
       await Promise.all(workers);
+      if (transientChunkRetries > 0) {
+        this.reduceAdaptiveUploadConcurrency(`chunk retries=${transientChunkRetries} file=${filename}`);
+      }
+    } catch (err) {
+      // A 413 seen by any worker means the chunk size is too big for this host.
+      // Normalize whatever won the Promise.all race (often a socket hang up /
+      // ECONNRESET from nginx closing the connection on the oversized body) into a
+      // payload-limit error so uploadToAgentChunked halves the chunk size and
+      // re-runs the session instead of failing the whole Push.
+      if (sawPayloadLimit || this.isChunkSizeRejection(err)) {
+        await this.abortUploadSession(siteUrl, appPassword, uploadId);
+      } else {
+        Logger.log(`[RemoteService] runChunkedUploadSession keeping resumable upload session uploadId=${uploadId} after error=${this.formatShortError(err)}`);
+      }
+      if (sawPayloadLimit && !this.isChunkSizeRejection(err)) {
+        throw new Error(`Chunk upload failed: 413 Request Entity Too Large (chunk size ${this.formatBytes(chunkSize)} exceeds host limit)`);
+      }
+      throw err;
     } finally {
       await fileHandle.close();
     }
 
-    const finalize = await this.agentRequest(siteUrl, appPassword, 'upload_finalize', {
-      upload_id: uploadId,
-    });
+    let finalize: any;
+    try {
+      finalize = await this.agentRequest(siteUrl, appPassword, 'upload_finalize', {
+        upload_id: uploadId,
+      }, AGENT_UPLOAD_CONTROL_TIMEOUT_MS);
+    } catch (err) {
+      Logger.log(`[RemoteService] upload_finalize failed; keeping resumable upload session uploadId=${uploadId} error=${this.formatShortError(err)}`);
+      throw err;
+    }
 
     const token = String(finalize?.file_token || '');
     if (!token) {
@@ -3340,6 +5128,18 @@ if (!defined('ABSPATH')) { exit; }
     return token;
   }
 
+  private async abortUploadSession(siteUrl: string, appPassword: string, uploadId: string): Promise<void> {
+    if (!uploadId) {return;}
+    try {
+      await this.agentRequest(siteUrl, appPassword, 'upload_abort', { upload_id: uploadId }, AGENT_UPLOAD_CONTROL_TIMEOUT_MS);
+      Logger.log(`[RemoteService] upload_abort SUCCESS uploadId=${uploadId}`);
+    } catch (err) {
+      // Best effort only. Older agents do not have upload_abort, and the cleanup
+      // cron will eventually remove expired sessions.
+      Logger.log(`[RemoteService] upload_abort SKIPPED/FAILED uploadId=${uploadId} error=${this.formatShortError(err)}`);
+    }
+  }
+
   private async uploadChunkToAgent(
     siteUrl: string,
     appPassword: string,
@@ -3347,7 +5147,7 @@ if (!defined('ABSPATH')) { exit; }
     chunkIndex: number,
     filename: string,
     chunk: Buffer
-  ): Promise<void> {
+  ): Promise<number> {
     const fetch = (await import('node-fetch')).default;
     const FormData = (await import('form-data')).default;
     const token = await this.getAgentToken(appPassword);
@@ -3382,7 +5182,7 @@ if (!defined('ABSPATH')) { exit; }
           lastError = new Error(`Chunk upload failed: ${res.status} ${text}`);
           Logger.log(`[RemoteService] uploadChunkToAgent FAILED attempt=${attempt}/${UPLOAD_RETRY_COUNT} chunkIndex=${chunkIndex} status=${res.status} duration=${duration}ms`);
           
-          if (attempt < UPLOAD_RETRY_COUNT && !this.isPermanentError(res.status)) {
+          if (attempt < UPLOAD_RETRY_COUNT && !this.isPermanentError(res.status) && !this.isUploadStorageError(lastError)) {
             await new Promise(r => setTimeout(r, UPLOAD_RETRY_DELAY_MS * attempt));
             continue;
           }
@@ -3402,11 +5202,16 @@ if (!defined('ABSPATH')) { exit; }
         }
 
         Logger.log(`[RemoteService] uploadChunkToAgent SUCCESS chunkIndex=${chunkIndex} size=${this.formatBytes(chunk.length)} duration=${duration}ms`);
-        return;
+        return attempt - 1;
       } catch (err: any) {
         upload.clear();
         lastError = err;
-        if (attempt === UPLOAD_RETRY_COUNT) {
+        // A 413 is permanent for this chunk size: retrying the same oversized body
+        // only hammers the host and lets a connection reset race ahead and mask the
+        // 413. Fail fast so the session aborts and the chunk size is halved upstream.
+        // Storage/quota failures are also permanent until the server frees space;
+        // retrying the same chunk wastes minutes on slow hosts.
+        if (attempt === UPLOAD_RETRY_COUNT || this.isChunkSizeRejection(err) || this.isUploadStorageError(err)) {
           Logger.log(`[RemoteService] uploadChunkToAgent FAILED ALL ATTEMPTS chunkIndex=${chunkIndex} error=${err.message}`);
           throw err;
         }
@@ -3421,15 +5226,31 @@ if (!defined('ABSPATH')) { exit; }
   private isPermanentError(status: number): boolean {
     // 4xx errors (except 429) are usually permanent
     // 5xx errors are usually temporary
-    return status >= 400 && status < 500 && status !== 429;
+    return (status >= 400 && status < 500 && status !== 429) || status === 507;
   }
 
   private isRetryableUploadError(error: unknown): boolean {
     const raw = String((error as any)?.message ?? error ?? '').toLowerCase();
-    if (this.isPayloadLimitError(error)) {
+    // Agent single-file uploads can report 507 "Failed to write chunk data" when
+    // a shared host flakes under concurrent offset writes even though
+    // disk_free_space still shows plenty of room. Keep the resumable session and
+    // retry with adaptive concurrency instead of aborting the whole split-push.
+    if (this.isTransientChunkWriteError(error)) {
+      return true;
+    }
+    if (this.isChunkSizeRejection(error) || this.isUploadStorageError(error)) {
       return false;
     }
-    return /timed out|timeout|econnreset|socket hang up|fetch failed|network|bad gateway|gateway timeout|service unavailable|upload session expired|502|503|504/.test(raw);
+    if (this.isAbortError(error)) {
+      return true;
+    }
+    // Agent 1.3.15+: sha256 mismatch resets the server session (retry re-uploads
+    // from scratch); partial extract failures keep the uploaded archive server-side
+    // (retry re-runs extraction of the same token without re-uploading).
+    if (raw.includes('sha256 mismatch') || raw.includes('zip direct extract failed')) {
+      return true;
+    }
+    return /timed out|timeout|econnreset|etimedout|socket hang up|fetch failed|network|wrong_version_number|ssl routines|bad gateway|gateway timeout|service unavailable|upload session expired|502|503|504/.test(raw);
   }
 
   private async retryAsync<T>(label: string, attempts: number, task: () => Promise<T>): Promise<T> {
@@ -3467,6 +5288,43 @@ if (!defined('ABSPATH')) { exit; }
   private isChunkSizeRejection(error: unknown): boolean {
     const raw = String((error as any)?.message ?? error ?? '').toLowerCase();
     return /\b413\b|payload too large|request entity too large|entity too large/.test(raw);
+  }
+
+  /**
+   * The agent returns these when PHP received the request but the remote
+   * filesystem could not persist it (disk quota, full partition, permissions).
+   * They are not solved by retrying the identical chunk.
+   */
+  private isUploadStorageError(error: unknown): boolean {
+    const raw = String((error as any)?.message ?? error ?? '').toLowerCase();
+    return (
+      raw.includes('cannot store uploaded chunk') ||
+      raw.includes('insufficient server disk space') ||
+      raw.includes('no space left on device') ||
+      raw.includes('disk quota') ||
+      raw.includes('quota exceeded') ||
+      raw.includes('cannot create destination file') ||
+      raw.includes('cannot assemble uploaded chunks')
+    );
+  }
+
+  private isTransientChunkWriteError(error: unknown): boolean {
+    const raw = String((error as any)?.message ?? error ?? '').toLowerCase();
+    return (
+      raw.includes('failed to write chunk data') ||
+      raw.includes('failed to mark uploaded chunk')
+    );
+  }
+
+  /**
+   * True when the agent reports the chunked-upload session is gone — either expired
+   * (410) or not found (404). The agent's messages are "Upload session expired" and
+   * "Upload session not found or expired"; matching those (and the bare status) lets
+   * uploadToAgentChunked re-init a fresh session instead of failing the whole Push.
+   */
+  private isUploadSessionExpired(error: unknown): boolean {
+    const raw = String((error as any)?.message ?? error ?? '').toLowerCase();
+    return /\b410\b|upload session expired|upload session not found|session not found or expired/.test(raw);
   }
 
   private isMissingChunkApiError(error: unknown): boolean {
@@ -3614,6 +5472,23 @@ if (!defined('ABSPATH')) { exit; }
     return createHash('sha256').update(normalized).digest('hex');
   }
 
+  private async hashFile(filePath: string): Promise<string> {
+    const { createHash } = await import('crypto');
+    const hash = createHash('sha256');
+    await new Promise<void>((resolve, reject) => {
+      const stream = fs.createReadStream(filePath);
+      stream.on('data', (chunk) => hash.update(chunk));
+      stream.on('error', reject);
+      stream.on('end', resolve);
+    });
+    return hash.digest('hex');
+  }
+
+  private makeUploadResumeKey(fileHash: string, totalBytes: number, ext: string): string {
+    // Stable across local temp filenames, but changes if the archive/SQL bytes change.
+    return `sha256:${fileHash}:bytes:${totalBytes}:ext:${String(ext || '').toLowerCase().replace(/[^a-z0-9.]/g, '')}`;
+  }
+
   private normalizeAppPassword(rawValue: string): string {
     // WordPress application passwords are often shown as grouped chunks with spaces.
     // Normalize to a stable token/auth value regardless of input formatting.
@@ -3623,6 +5498,482 @@ if (!defined('ABSPATH')) { exit; }
   private formatShortError(error: unknown, maxLen = 260): string {
     const raw = String((error as any)?.message ?? error ?? 'unknown error').replace(/\s+/g, ' ').trim();
     return raw.length > maxLen ? `${raw.slice(0, maxLen - 3)}...` : raw;
+  }
+
+  private async createPushArchivePlan(sourceDir: string, devMode: boolean): Promise<PushArchivePlan> {
+    const entries = this.collectPushArchiveEntries(sourceDir, devMode)
+      .sort((a, b) => a.rel.localeCompare(b.rel));
+    if (entries.length === 0) {
+      throw new Error('nothing to pack (empty WP root)');
+    }
+
+    const parts: PushArchivePart[] = [];
+    let current: PushArchiveEntry[] = [];
+    let currentBytes = 0;
+    let totalBytes = 0;
+
+    const flush = () => {
+      if (current.length === 0) { return; }
+      parts.push({ entries: current, estimatedBytes: currentBytes });
+      current = [];
+      currentBytes = 0;
+    };
+
+    for (const entry of entries) {
+      totalBytes += entry.size;
+      if (current.length > 0 && currentBytes + entry.size > PUSH_SPLIT_PART_TARGET_BYTES) {
+        flush();
+      }
+      current.push(entry);
+      currentBytes += entry.size;
+    }
+    flush();
+
+    Logger.log(
+      `[PUSH-SPLIT] plan files=${entries.length} estimated=${this.formatBytes(totalBytes)} ` +
+      `parts=${parts.length} threshold=${this.formatBytes(PUSH_SPLIT_THRESHOLD_BYTES)} ` +
+      `target=${this.formatBytes(PUSH_SPLIT_PART_TARGET_BYTES)} devMode=${devMode}`
+    );
+
+    return { entries, parts, totalBytes };
+  }
+
+  private collectPushArchiveEntries(sourceDir: string, devMode: boolean): PushArchiveEntry[] {
+    const normalizedSourceDir = path.resolve(sourceDir);
+    const externalWpContentDir = path.resolve(path.dirname(normalizedSourceDir), 'wp-content');
+    const internalWpContentDir = path.resolve(normalizedSourceDir, 'wp-content');
+    const hasExternalWpContent =
+      fs.existsSync(externalWpContentDir) &&
+      externalWpContentDir !== internalWpContentDir &&
+      fs.statSync(externalWpContentDir).isDirectory() &&
+      (!fs.existsSync(internalWpContentDir) || fs.lstatSync(internalWpContentDir).isSymbolicLink());
+
+    const entries: PushArchiveEntry[] = [];
+    const seenDirs = new Set<string>();
+    this.collectPushArchiveEntriesFromDir(
+      normalizedSourceDir,
+      '',
+      devMode,
+      entries,
+      seenDirs,
+      hasExternalWpContent ? 'wp-content' : undefined
+    );
+    if (hasExternalWpContent) {
+      this.collectPushArchiveEntriesFromDir(externalWpContentDir, 'wp-content', devMode, entries, seenDirs);
+    }
+    return entries;
+  }
+
+  private collectPushArchiveEntriesFromDir(
+    rootDir: string,
+    relPrefix: string,
+    devMode: boolean,
+    entries: PushArchiveEntry[],
+    seenDirs: Set<string>,
+    skipTopLevelName?: string
+  ): void {
+    const rootReal = fs.realpathSync(rootDir);
+    const stack: Array<{ abs: string; rel: string }> = [{ abs: rootDir, rel: relPrefix }];
+    seenDirs.add(rootReal);
+
+    while (stack.length > 0) {
+      const current = stack.pop()!;
+      let items: fs.Dirent[];
+      try {
+        items = fs.readdirSync(current.abs, { withFileTypes: true });
+      } catch (err) {
+        Logger.log(`[PUSH-SPLIT] skip unreadable dir=${current.abs} error=${this.formatShortError(err)}`);
+        continue;
+      }
+
+      for (const item of items) {
+        if (!current.rel && skipTopLevelName && item.name === skipTopLevelName) {
+          continue;
+        }
+        const rel = (current.rel ? `${current.rel}/${item.name}` : item.name).replace(/\\/g, '/');
+        if (this.shouldSkipPushArchivePath(rel, item.isDirectory(), devMode)) {
+          continue;
+        }
+
+        const abs = path.join(current.abs, item.name);
+        let stat: fs.Stats;
+        try {
+          stat = fs.statSync(abs);
+        } catch (err) {
+          Logger.log(`[PUSH-SPLIT] skip unreadable path=${abs} error=${this.formatShortError(err)}`);
+          continue;
+        }
+
+        if (stat.isDirectory()) {
+          let real: string;
+          try {
+            real = fs.realpathSync(abs);
+          } catch {
+            real = abs;
+          }
+          if (seenDirs.has(real)) {
+            continue;
+          }
+          seenDirs.add(real);
+          stack.push({ abs, rel });
+        } else if (stat.isFile()) {
+          entries.push({ abs, rel, size: stat.size, mtimeMs: Math.round(stat.mtimeMs) });
+        }
+      }
+    }
+  }
+
+  private shouldSkipPushArchivePath(relPath: string, _isDir: boolean, devMode: boolean): boolean {
+    const rel = relPath.replace(/\\/g, '/').replace(/^\/+/, '');
+    const lower = rel.toLowerCase();
+    const segments = lower.split('/').filter(Boolean);
+    const name = segments[segments.length - 1] ?? '';
+
+    if (!rel || segments.some((segment) => segment.startsWith('.'))) { return true; }
+    if (segments.includes('node_modules') || segments.includes('.git')) { return true; }
+    if (segments.includes('.vscode') || segments.includes('.idea')) { return true; }
+    if (name === 'wp-config.php' || name === 'database.sql' || name === '.gitignore') { return true; }
+    if (/^wpdock-db-bridge-[a-f0-9]{24}\.php$/.test(name) || /^wpdock-db-[a-f0-9]{24}\.sql$/.test(name)) {
+      return true;
+    }
+    if (name === '.ds_store' || name === 'thumbs.db') { return true; }
+    if (name.endsWith('.swp') || name.endsWith('.swo')) { return true; }
+    if (name === '.env.local' || (name.startsWith('.env.') && name.endsWith('.local'))) { return true; }
+    if (lower === 'wp-content/debug.log') { return true; }
+    if (lower === 'wp-content/cache' || lower.startsWith('wp-content/cache/')) { return true; }
+    if (lower === 'wp-content/upgrade' || lower.startsWith('wp-content/upgrade/')) { return true; }
+    if (lower === 'wp-content/backup' || lower.startsWith('wp-content/backup/')) { return true; }
+    if (lower === 'wp-content/plugins/wpdock-agent.php') { return true; }
+    if (lower === 'wp-content/plugins/wpdock-agent' || lower.startsWith('wp-content/plugins/wpdock-agent/')) {
+      return true;
+    }
+
+    if (devMode) {
+      if (lower === 'wp-content/uploads' || lower.startsWith('wp-content/uploads/')) { return true; }
+      if (segments.includes('vendor') || segments.includes('dist') || segments.includes('build')) { return true; }
+      if (segments.includes('.turbo') || segments.includes('.next') || segments.includes('.nuxt')) { return true; }
+    }
+
+    return false;
+  }
+
+  private async pushSplitArchives(
+    remoteId: string,
+    siteUrl: string,
+    appPassword: string,
+    sourceDir: string,
+    plan: PushArchivePlan,
+    planKey: string,
+    archiver: any,
+    devMode: boolean,
+    onProgress: (phase: string, msg: string, pct?: number) => void,
+    prefetchedRemoteMap?: Record<string, FileManifestEntry>
+  ): Promise<{ archiveCount: number; archiveBytes: number }> {
+    const totalEstimated = Math.max(1, plan.totalBytes);
+    const transferState = this.readTransferState(sourceDir, remoteId) ?? this.baseTransferState(remoteId);
+    let pushState = transferState.pushFiles?.planKey === planKey && transferState.pushFiles.mode === 'split'
+      ? transferState.pushFiles
+      : undefined;
+    if (!pushState) {
+      pushState = { planKey, mode: 'split', completedParts: [] };
+      transferState.pushFiles = pushState;
+      this.writeTransferState(sourceDir, remoteId, transferState);
+    }
+    const completedParts = new Set<number>(
+      (pushState.completedParts ?? [])
+        .map((value) => Number(value))
+        .filter((value) => Number.isInteger(value) && value >= 0 && value < plan.parts.length)
+    );
+
+    // Resume-части проверяем по реальному manifest сервера: часть считается
+    // перенесённой только если все её файлы существуют на сервере.
+    if (completedParts.size > 0) {
+      onProgress('verifying', `Проверка уже перенесённых частей на сервере (${completedParts.size}/${plan.parts.length})...`, 8);
+      let remoteMap = prefetchedRemoteMap;
+      if (!remoteMap) {
+        try {
+          remoteMap = await this.fetchAgentManifestMap(siteUrl, appPassword, devMode);
+        } catch (err) {
+          Logger.log(`[PUSH-SPLIT] resume verify недоступен — все части будут загружены заново: ${this.formatShortError(err)}`);
+        }
+      }
+      if (!remoteMap) {
+        completedParts.clear();
+      } else {
+        for (const index of Array.from(completedParts)) {
+          const missing = this.findMissingOnRemote(plan.parts[index].entries, remoteMap);
+          if (missing.length > 0) {
+            completedParts.delete(index);
+            Logger.log(
+              `[PUSH-SPLIT] resume part ${index + 1}/${plan.parts.length} невалидна: ` +
+              `на сервере нет ${missing.length} файлов sample=${missing.slice(0, 3).join(', ')}`
+            );
+          }
+        }
+      }
+      pushState.completedParts = Array.from(completedParts).sort((a, b) => a - b);
+      pushState.completed = false;
+      transferState.pushFiles = pushState;
+      this.writeTransferState(sourceDir, remoteId, transferState);
+      Logger.log(`[PUSH-SPLIT] resume verify done valid_parts=${completedParts.size}/${plan.parts.length}`);
+    }
+
+    // Дисковый бюджет сервера: пик должен быть ≈ размер сайта + 1 часть.
+    // Остатки прошлых неудачных попыток (upload-*.zip и chunks-* сессии живут
+    // до 24 ч ради resume) способны удвоить требуемое место. Если resume не
+    // нашёл ни одной перенесённой части, переиспользовать нечего — освобождаем
+    // место до начала загрузки.
+    if (completedParts.size === 0) {
+      await this.cleanupUploadLeftovers(siteUrl, appPassword, 'fresh split push');
+    }
+
+    let completedEstimated = plan.parts.reduce((sum, part, index) => (
+      completedParts.has(index) ? sum + part.estimatedBytes : sum
+    ), 0);
+    let archiveBytes = 0;
+
+    Logger.log(
+      `[PUSH-SPLIT] START parts=${plan.parts.length} files=${plan.entries.length} ` +
+      `estimated=${this.formatBytes(plan.totalBytes)}`
+    );
+    try {
+      for (let i = 0; i < plan.parts.length; i++) {
+        const part = plan.parts[i];
+        const partNo = i + 1;
+        if (completedParts.has(i)) {
+          Logger.log(`[PUSH-SPLIT] resume skip already extracted part ${partNo}/${plan.parts.length}`);
+          onProgress(
+            'extracting',
+            `Файлы уже перенесены: часть ${partNo}/${plan.parts.length}`,
+            65 + Math.round((completedEstimated / totalEstimated) * 5)
+          );
+          continue;
+        }
+        const zipPath = path.join(os.tmpdir(), `wpdock-push-${Date.now()}-part-${partNo}-of-${plan.parts.length}.zip`);
+        const partBasePct = 10 + Math.round((completedEstimated / totalEstimated) * 20);
+
+        try {
+          onProgress(
+            'packaging',
+            `Упаковка файлов: часть ${partNo}/${plan.parts.length} (${part.entries.length} файлов)...`,
+            partBasePct
+          );
+          const packStart = Date.now();
+          await this.createZipPart(sourceDir, zipPath, part.entries, archiver, devMode, true);
+          const zipStats = fs.statSync(zipPath);
+          archiveBytes += zipStats.size;
+          Logger.log(
+            `[PUSH-SPLIT] part ${partNo}/${plan.parts.length} packed ` +
+            `files=${part.entries.length} estimated=${this.formatBytes(part.estimatedBytes)} ` +
+            `zip=${this.formatBytes(zipStats.size)} elapsed=${Date.now() - packStart}ms`
+          );
+
+          const uploadToken = await this.uploadToAgent(
+            siteUrl,
+            appPassword,
+            zipPath,
+            (uploadedBytes, totalBytes) => {
+              const ratio = totalBytes > 0 ? Math.min(1, uploadedBytes / totalBytes) : 1;
+              const weighted = (completedEstimated + part.estimatedBytes * ratio) / totalEstimated;
+              const pct = 30 + Math.round(Math.min(1, weighted) * 35);
+              onProgress(
+                'uploading',
+                `Загрузка файлов: часть ${partNo}/${plan.parts.length} — ${this.formatBytes(uploadedBytes)} / ${this.formatBytes(totalBytes)}`,
+                pct
+              );
+            }
+          );
+
+          const extractPct = 65 + Math.round(((i + 0.5) / plan.parts.length) * 5);
+          onProgress('extracting', `Распаковка файлов: часть ${partNo}/${plan.parts.length}...`, extractPct);
+          const extractResult = await this.retryAsync(`extract_files part ${partNo}/${plan.parts.length}`, 2, () => this.agentRequest(siteUrl, appPassword, 'extract_files', {
+            file_token: uploadToken,
+          }, AGENT_HEAVY_OP_TIMEOUT_MS));
+          Logger.log(
+            `[PUSH-SPLIT] part ${partNo}/${plan.parts.length} extracted result=${JSON.stringify(extractResult ?? {})}`
+          );
+
+          completedEstimated += part.estimatedBytes;
+          completedParts.add(i);
+          pushState.completedParts = Array.from(completedParts).sort((a, b) => a - b);
+          pushState.completed = completedParts.size === plan.parts.length;
+          transferState.pushFiles = pushState;
+          this.writeTransferState(sourceDir, remoteId, transferState);
+          onProgress(
+            'extracting',
+            `Файлы перенесены: часть ${partNo}/${plan.parts.length}`,
+            65 + Math.round((completedEstimated / totalEstimated) * 5)
+          );
+        } finally {
+          if (fs.existsSync(zipPath)) {
+            try { fs.unlinkSync(zipPath); } catch { /* ignore temp cleanup failures */ }
+          }
+        }
+      }
+    } catch (err) {
+      Logger.log(`[PUSH-SPLIT] failed; keeping resumable state for retry error=${this.formatShortError(err)}`);
+      throw err;
+    }
+
+    pushState.completed = true;
+    transferState.pushFiles = pushState;
+    this.writeTransferState(sourceDir, remoteId, transferState);
+    Logger.log(
+      `[PUSH-SPLIT] SUCCESS parts=${plan.parts.length} uploaded=${this.formatBytes(archiveBytes)}`
+    );
+    // Каждая часть удаляется агентом сразу после распаковки, но прерванные
+    // ранее сессии/completed-записи ждут TTL 24 ч — подчищаем их сейчас.
+    await this.cleanupUploadLeftovers(siteUrl, appPassword, 'split push success');
+    return { archiveCount: plan.parts.length, archiveBytes };
+  }
+
+  /**
+   * Best-effort очистка upload-остатков на сервере (upload-*.zip, chunks-*
+   * сессии, completed-uploads). Ошибка не прерывает push — это оптимизация
+   * дискового бюджета, а не обязательный шаг.
+   */
+  private async cleanupUploadLeftovers(siteUrl: string, appPassword: string, reason: string): Promise<void> {
+    try {
+      const result = await this.agentRequest(siteUrl, appPassword, 'cleanup_uploads', {}, AGENT_HEAVY_OP_TIMEOUT_MS);
+      Logger.log(`[PUSH-SPLIT] cleanup_uploads (${reason}) result=${JSON.stringify(result ?? {})}`);
+    } catch (err) {
+      Logger.log(`[PUSH-SPLIT] cleanup_uploads (${reason}) failed (ignored): ${this.formatShortError(err)}`);
+    }
+  }
+
+  private async createZipPart(
+    sourceDir: string,
+    destZip: string,
+    entries: PushArchiveEntry[],
+    archiver: any,
+    devMode: boolean,
+    enableLogging: boolean
+  ): Promise<void> {
+    if (entries.length === 0) {
+      throw new Error('cannot pack empty archive part');
+    }
+
+    const normalizedSourceDir = path.resolve(sourceDir);
+    const canUseNative =
+      process.platform === 'win32' &&
+      entries.every((entry) => this.isPathInside(normalizedSourceDir, entry.abs));
+
+    if (canUseNative) {
+      try {
+        await this.createZipPartNative(normalizedSourceDir, destZip, entries, devMode, enableLogging);
+        return;
+      } catch (err: any) {
+        if (enableLogging) {
+          Logger.log(`[ZIP] native split part failed (${err?.message ?? err}); fallback → archiver`);
+        }
+        try { fs.rmSync(destZip, { force: true }); } catch { /* ignore */ }
+      }
+    }
+
+    await this.createZipPartArchiver(destZip, entries, archiver, devMode, enableLogging);
+  }
+
+  private async createZipPartNative(
+    sourceDir: string,
+    destZip: string,
+    entries: PushArchiveEntry[],
+    devMode: boolean,
+    enableLogging: boolean
+  ): Promise<void> {
+    const tarBin = (() => {
+      const sys = path.join(process.env.WINDIR || 'C:\\Windows', 'System32', 'tar.exe');
+      return fs.existsSync(sys) ? sys : 'tar';
+    })();
+    const listPath = path.join(os.tmpdir(), `wpdock-tar-list-${Date.now()}-${Math.random().toString(16).slice(2)}.txt`);
+    fs.writeFileSync(listPath, entries.map((entry) => entry.rel).join('\n'), 'utf8');
+
+    const args = [
+      '--format=zip',
+      `--options=zip:compression=${devMode ? 'store' : 'deflate'}`,
+      '--dereference',
+      '-v',
+      '-c', '-f', destZip,
+      '-C', sourceDir,
+      '-T', listPath,
+    ];
+
+    if (enableLogging) {
+      Logger.log(
+        `[ZIP] native split tar bin=${tarBin} entries=${entries.length} ` +
+        `estimated=${this.formatBytes(entries.reduce((sum, entry) => sum + entry.size, 0))} ` +
+        `compression=${devMode ? 'store' : 'deflate'}`
+      );
+    }
+
+    let packed = 0;
+    let stderrTail = '';
+    const countLines = (s: string) => {
+      for (let i = 0; i < s.length; i++) { if (s.charCodeAt(i) === 10) { packed++; } }
+    };
+
+    try {
+      await new Promise<void>((resolve, reject) => {
+        const proc = cp.spawn(tarBin, args, { windowsHide: true });
+        proc.stdout?.on('data', (d) => countLines(d.toString()));
+        proc.stderr?.on('data', (d) => {
+          const s = d.toString();
+          countLines(s);
+          stderrTail = (stderrTail + s).slice(-2000);
+        });
+        proc.on('error', reject);
+        proc.on('close', (code) => {
+          const size = fs.existsSync(destZip) ? fs.statSync(destZip).size : 0;
+          if (code === 0 || (code === 1 && size > 0)) {
+            resolve();
+          } else {
+            reject(new Error(`tar exit ${code}: ${stderrTail.slice(-500)}`));
+          }
+        });
+      });
+    } finally {
+      try { fs.unlinkSync(listPath); } catch { /* ignore */ }
+    }
+
+    const size = fs.existsSync(destZip) ? fs.statSync(destZip).size : 0;
+    if (size === 0) { throw new Error('native split zip produced empty file'); }
+    if (enableLogging) {
+      Logger.log(`[ZIP] native split tar created path=${destZip} size=${this.formatBytes(size)} objects=${packed}`);
+    }
+  }
+
+  private createZipPartArchiver(
+    destZip: string,
+    entries: PushArchiveEntry[],
+    archiver: any,
+    devMode: boolean,
+    enableLogging: boolean
+  ): Promise<void> {
+    return new Promise((resolve, reject) => {
+      const output = fs.createWriteStream(destZip);
+      const archive = archiver('zip', {
+        zlib: devMode ? false : { level: ZIP_COMPRESSION_LEVEL },
+      });
+
+      output.on('close', () => {
+        const bytes = fs.statSync(destZip).size;
+        if (enableLogging) {
+          Logger.log(`[ZIP] split archiver created path=${destZip} size=${this.formatBytes(bytes)} entries=${entries.length}`);
+        }
+        resolve();
+      });
+      output.on('error', reject);
+      archive.on('error', reject);
+      archive.pipe(output);
+      for (const entry of entries) {
+        archive.file(entry.abs, { name: entry.rel });
+      }
+      archive.finalize();
+    });
+  }
+
+  private isPathInside(parentDir: string, childPath: string): boolean {
+    const rel = path.relative(path.resolve(parentDir), path.resolve(childPath));
+    return rel === '' || (!!rel && !rel.startsWith('..') && !path.isAbsolute(rel));
   }
 
   private getAgentZipPath(): string {

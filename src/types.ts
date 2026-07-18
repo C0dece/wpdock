@@ -49,6 +49,8 @@ export interface RemoteSite {
   adminUrl: string;      // WP admin URL
   username: string;
   appPassword: string;   // WP Application Password
+  fileTransferMode?: 'agent' | 'ftp';
+  ftp?: RemoteFtpConfig;
   agentInstalled: boolean;
   /** Live version reported by the agent on the server (kept fresh on every check/update). */
   agentVersion?: string;
@@ -66,6 +68,14 @@ export interface RemoteSite {
   lastSyncMessage?: string;
   syncHistory?: RemoteSyncEvent[];
   createdAt: string;
+}
+
+export interface RemoteFtpConfig {
+  host: string;
+  port?: number;
+  username: string;
+  rootPath: string;      // FTP path to WordPress root, e.g. /public_html
+  secure?: boolean;      // explicit FTPS
 }
 
 export interface RemoteSyncEvent {

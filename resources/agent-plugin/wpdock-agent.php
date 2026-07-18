@@ -3,8 +3,8 @@
 /**
  * Plugin Name: WPDock Agent
  * Plugin URI:  https://github.com/wpdock/wpdock
- * Description: Secure agent plugin for WPDock VS Code extension — enables file/DB sync without FTP.
- * Version:     1.3.9
+ * Description: Secure agent plugin for WPDock VS Code extension — enables file/DB sync over HTTPS.
+ * Version:     1.3.18
  * Author:      WPDock
  * License:     GPL-2.0-or-later
  */
@@ -13,7 +13,7 @@ if (! defined('ABSPATH')) {
   exit;
 }
 
-define('WPDOCK_AGENT_VERSION', '1.3.9');
+define('WPDOCK_AGENT_VERSION', '1.3.18');
 define('WPDOCK_TEMP_DIR', WP_CONTENT_DIR . '/wpdock-temp');
 
 // Bootstrap on init
@@ -35,7 +35,13 @@ function wpdock_agent_handle_request()
 
   switch ($action) {
     case 'ping':
-      wpdock_json_success(array('version' => WPDOCK_AGENT_VERSION));
+      // Opportunistic TTL sweep before the write probe: freeing expired
+      // leftovers can turn a "temp unwritable" ping into a healthy one.
+      wpdock_maybe_temp_sweep();
+      wpdock_json_success(array_merge(
+        array('version' => WPDOCK_AGENT_VERSION),
+        wpdock_temp_status()
+      ));
       break;
 
     case 'pack_files':
@@ -44,6 +50,10 @@ function wpdock_agent_handle_request()
 
     case 'list_files':
       wpdock_list_files();
+      break;
+
+    case 'file_manifest':
+      wpdock_file_manifest();
       break;
 
     case 'export_db':
@@ -62,6 +72,14 @@ function wpdock_agent_handle_request()
       wpdock_upload_chunk();
       break;
 
+    case 'upload_abort':
+      wpdock_upload_abort();
+      break;
+
+    case 'cleanup_uploads':
+      wpdock_cleanup_uploads();
+      break;
+
     case 'upload_finalize':
       wpdock_upload_finalize();
       break;
@@ -76,6 +94,14 @@ function wpdock_agent_handle_request()
 
     case 'download':
       wpdock_download_file();
+      break;
+
+    case 'download_path':
+      wpdock_download_path();
+      break;
+
+    case 'delete_paths':
+      wpdock_delete_paths();
       break;
 
     case 'get_part':
@@ -441,6 +467,191 @@ function wpdock_list_files(): void
     'bytes'            => $bytes,
     'content_base_url' => content_url(),
   ));
+}
+
+/**
+ * Full WordPress-root manifest for incremental hosting sync.
+ * Lines: relative/path<TAB>size<TAB>mtime_unix_seconds
+ */
+function wpdock_file_manifest(): void
+{
+  @set_time_limit(0);
+  @ignore_user_abort(true);
+  $input = json_decode(file_get_contents('php://input'), true);
+  if (! is_array($input)) {
+    $input = array();
+  }
+  $dev_mode     = ! empty($input['dev_mode']);
+  $skip_uploads = ! empty($input['skip_uploads']);
+
+  wpdock_ensure_temp_dir();
+  $id = bin2hex(random_bytes(8));
+  $manifest_file = WPDOCK_TEMP_DIR . '/manifest-' . $id . '.tsv';
+  $fh = fopen($manifest_file, 'w');
+  if ($fh === false) {
+    wpdock_json_error('Cannot create manifest', 500);
+  }
+
+  $root = rtrim(str_replace('\\', '/', ABSPATH), '/') . '/';
+  $total = 0;
+  $bytes = 0;
+  $iter = new RecursiveIteratorIterator(
+    new RecursiveDirectoryIterator($root, RecursiveDirectoryIterator::SKIP_DOTS),
+    RecursiveIteratorIterator::SELF_FIRST
+  );
+  foreach ($iter as $file) {
+    $real = $file->getRealPath();
+    if ($real === false) {
+      continue;
+    }
+    $real_norm = str_replace('\\', '/', $real);
+    $rel = ltrim(substr($real_norm, strlen($root)), '/');
+    if ($rel === '' || wpdock_should_skip_manifest_path($rel, $file->isDir(), $dev_mode, $skip_uploads)) {
+      continue;
+    }
+    if (! $file->isFile()) {
+      continue;
+    }
+    if (strpbrk($rel, "\t\n") !== false) {
+      continue;
+    }
+    $size = (int) $file->getSize();
+    $line = $rel . "\t" . $size . "\t" . (int) $file->getMTime() . "\n";
+    // On a full disk / exceeded quota fwrite silently truncates the manifest,
+    // and resume verify would then trust an incomplete file list.
+    if (fwrite($fh, $line) !== strlen($line)) {
+      fclose($fh);
+      @unlink($manifest_file);
+      wpdock_json_error('Cannot write manifest (disk full or hosting quota exceeded?)', 500);
+    }
+    $total++;
+    $bytes += $size;
+  }
+  fclose($fh);
+
+  $token = wpdock_store_temp_file($manifest_file);
+  error_log('[WPDock] file_manifest total=' . $total . ' bytes=' . $bytes . ' dev=' . ($dev_mode ? '1' : '0'));
+  wpdock_json_success(array(
+    'file_token' => $token,
+    'total'      => $total,
+    'bytes'      => $bytes,
+  ));
+}
+
+function wpdock_download_path(): void
+{
+  @set_time_limit(0);
+  @ignore_user_abort(true);
+  $rel = isset($_GET['path']) ? (string) $_GET['path'] : '';
+  $file = wpdock_resolve_root_rel($rel);
+  if (! $file || ! is_file($file)) {
+    wpdock_json_error('File not found', 404);
+  }
+
+  header('Content-Type: application/octet-stream');
+  header('Content-Length: ' . filesize($file));
+  header('Content-Disposition: attachment; filename="' . basename($file) . '"');
+  while (ob_get_level() > 0) {
+    @ob_end_clean();
+  }
+  readfile($file);
+  exit;
+}
+
+function wpdock_delete_paths(): void
+{
+  $input = json_decode(file_get_contents('php://input'), true);
+  if (! is_array($input)) {
+    $input = array();
+  }
+  $paths = (isset($input['paths']) && is_array($input['paths'])) ? $input['paths'] : array();
+  $deleted = 0;
+  $skipped = 0;
+  foreach ($paths as $rel) {
+    $file = wpdock_resolve_root_rel((string) $rel, false);
+    if (! $file || ! is_file($file)) {
+      $skipped++;
+      continue;
+    }
+    if (@unlink($file)) {
+      $deleted++;
+      wpdock_prune_empty_dirs(dirname($file));
+    } else {
+      $skipped++;
+    }
+  }
+  wpdock_json_success(array('deleted' => $deleted, 'skipped' => $skipped));
+}
+
+function wpdock_resolve_root_rel(string $rel, bool $must_exist = true)
+{
+  $rel = str_replace('\\', '/', rawurldecode($rel));
+  $rel = ltrim($rel, '/');
+  if ($rel === '' || strpos($rel, '..') !== false || strpbrk($rel, "\0\t\n\r") !== false) {
+    return false;
+  }
+  if (wpdock_should_skip_manifest_path($rel, false, false, false)) {
+    return false;
+  }
+  $root = rtrim(str_replace('\\', '/', ABSPATH), '/') . '/';
+  $path = $root . $rel;
+  $real = $must_exist ? realpath($path) : realpath(dirname($path));
+  if ($real === false) {
+    return $must_exist ? false : $path;
+  }
+  $real_norm = rtrim(str_replace('\\', '/', $real), '/');
+  $check = $must_exist ? $real_norm : ($real_norm . '/' . basename($path));
+  $root_trim = rtrim($root, '/');
+  if ($check !== $root_trim && strpos($check, $root_trim . '/') !== 0) {
+    return false;
+  }
+  return $must_exist ? $real_norm : $path;
+}
+
+function wpdock_should_skip_manifest_path(string $rel, bool $is_dir, bool $dev_mode, bool $skip_uploads): bool
+{
+  $rel = ltrim(str_replace('\\', '/', $rel), '/');
+  $lower = strtolower($rel);
+  $segments = array_values(array_filter(explode('/', $lower), 'strlen'));
+  $name = count($segments) > 0 ? $segments[count($segments) - 1] : '';
+  if ($rel === '') { return true; }
+  foreach ($segments as $seg) {
+    if ($seg !== '' && $seg[0] === '.') { return true; }
+  }
+  if (in_array('node_modules', $segments, true) || in_array('.git', $segments, true)) { return true; }
+  if (in_array('.vscode', $segments, true) || in_array('.idea', $segments, true)) { return true; }
+  if ($name === 'wp-config.php' || $name === 'database.sql' || $name === '.gitignore') { return true; }
+  if ($name === '.ds_store' || $name === 'thumbs.db' || substr($name, -4) === '.swp' || substr($name, -4) === '.swo') { return true; }
+  if ($name === '.env.local' || (strpos($name, '.env.') === 0 && substr($name, -6) === '.local')) { return true; }
+  if ($lower === 'wp-content/debug.log') { return true; }
+  if ($lower === 'wp-content/cache' || strpos($lower, 'wp-content/cache/') === 0) { return true; }
+  if ($lower === 'wp-content/upgrade' || strpos($lower, 'wp-content/upgrade/') === 0) { return true; }
+  if ($lower === 'wp-content/backup' || strpos($lower, 'wp-content/backup/') === 0) { return true; }
+  if ($lower === 'wp-content/wpdock-temp' || strpos($lower, 'wp-content/wpdock-temp/') === 0) { return true; }
+  if ($lower === 'wp-content/plugins/wpdock-agent.php') { return true; }
+  if ($lower === 'wp-content/plugins/wpdock-agent' || strpos($lower, 'wp-content/plugins/wpdock-agent/') === 0) { return true; }
+  if ($skip_uploads && ($lower === 'wp-content/uploads' || strpos($lower, 'wp-content/uploads/') === 0)) { return true; }
+  if ($dev_mode) {
+    if ($lower === 'wp-content/uploads' || strpos($lower, 'wp-content/uploads/') === 0) { return true; }
+    foreach (array('vendor', 'dist', 'build', '.turbo', '.next', '.nuxt') as $skip) {
+      if (in_array($skip, $segments, true)) { return true; }
+    }
+  }
+  return false;
+}
+
+function wpdock_prune_empty_dirs(string $dir): void
+{
+  $root = rtrim(str_replace('\\', '/', ABSPATH), '/');
+  $current = rtrim(str_replace('\\', '/', $dir), '/');
+  while ($current !== '' && strpos($current, $root) === 0 && $current !== $root) {
+    $items = @scandir($current);
+    if (! is_array($items) || count(array_diff($items, array('.', '..'))) > 0) {
+      break;
+    }
+    @rmdir($current);
+    $current = dirname($current);
+  }
 }
 
 function wpdock_pack_files_continue(string $id, int $shard = -1, bool $seq_dl = false): void
@@ -936,6 +1147,11 @@ function wpdock_upload_init(): void
 
   $filename = sanitize_file_name((string) ($body['filename'] ?? 'upload.bin'));
   $total_chunks = (int) ($body['total_chunks'] ?? 0);
+  $total_bytes = max(0, (int) ($body['total_bytes'] ?? 0));
+  $chunk_size = max(0, (int) ($body['chunk_size'] ?? 0));
+  $concurrency = max(1, min(16, (int) ($body['concurrency'] ?? 1)));
+  $resume_key = wpdock_sanitize_resume_key((string) ($body['resume_key'] ?? ''));
+  $requested_write_mode = sanitize_text_field((string) ($body['write_mode'] ?? 'single_file'));
   $ext = strtolower(pathinfo($filename, PATHINFO_EXTENSION));
 
   if ($total_chunks <= 0) {
@@ -948,30 +1164,139 @@ function wpdock_upload_init(): void
 
   wpdock_ensure_temp_dir();
 
-  $upload_id = bin2hex(random_bytes(16));
-  $chunk_dir = WPDOCK_TEMP_DIR . '/chunks-' . $upload_id;
-  if (! wp_mkdir_p($chunk_dir)) {
-    wpdock_json_error('Cannot create chunk directory', 500);
+  $single_file_mode = $total_bytes > 0 && $chunk_size > 0 && $requested_write_mode !== 'chunks';
+  $sessions = get_option('wpdock_upload_sessions', array());
+  if (! is_array($sessions)) {
+    $sessions = array();
   }
 
-  $sessions = get_option('wpdock_upload_sessions', array());
+  if ($resume_key !== '') {
+    $completed = get_option('wpdock_completed_uploads', array());
+    if (! is_array($completed)) {
+      $completed = array();
+    }
+    if (isset($completed[$resume_key]) && is_array($completed[$resume_key])) {
+      $token = sanitize_text_field((string) ($completed[$resume_key]['token'] ?? ''));
+      $expires = (int) ($completed[$resume_key]['expires'] ?? 0);
+      $file = $token !== '' && $expires >= time() ? wpdock_resolve_token($token) : null;
+      if ($file && file_exists($file)) {
+        wpdock_json_success(array(
+          'file_token' => $token,
+          'file_size' => (int) filesize($file),
+          'filename' => $filename,
+          'completed' => true,
+          'resumed' => true,
+        ));
+      }
+      unset($completed[$resume_key]);
+      update_option('wpdock_completed_uploads', $completed, false);
+    }
+
+    $sessions_changed = false;
+    foreach ($sessions as $existing_id => $existing) {
+      if (! is_array($existing) || (string) ($existing['resume_key'] ?? '') !== $resume_key) {
+        continue;
+      }
+
+      $existing_dir = (string) ($existing['dir'] ?? '');
+      $existing_target = (string) ($existing['target'] ?? '');
+      $compatible =
+        (int) ($existing['total_chunks'] ?? 0) === $total_chunks &&
+        (int) ($existing['total_bytes'] ?? 0) === $total_bytes &&
+        (int) ($existing['chunk_size'] ?? 0) === $chunk_size &&
+        (string) ($existing['write_mode'] ?? '') === ($single_file_mode ? 'single_file' : 'chunks') &&
+        strtolower(pathinfo((string) ($existing['filename'] ?? ''), PATHINFO_EXTENSION)) === $ext;
+
+      $usable_storage = $existing_dir !== '' && is_dir($existing_dir) &&
+        (! $single_file_mode || ($existing_target !== '' && file_exists($existing_target)));
+
+      if (! $compatible || ! $usable_storage || ((int) ($existing['expires'] ?? 0) < time())) {
+        wpdock_delete_upload_session((string) $existing_id, $sessions, true);
+        $sessions_changed = true;
+        continue;
+      }
+
+      $received_indices = wpdock_upload_received_indices($existing);
+      $received_bytes = wpdock_estimate_received_bytes($received_indices, $total_chunks, $chunk_size, $total_bytes);
+      if ($single_file_mode) {
+        wpdock_assert_upload_free_space($total_bytes, $chunk_size, $concurrency, $received_bytes);
+      }
+
+      $existing['filename'] = $filename;
+      $existing['expires'] = time() + DAY_IN_SECONDS;
+      $sessions[$existing_id] = $existing;
+      update_option('wpdock_upload_sessions', $sessions, false);
+
+      wpdock_json_success(array(
+        'upload_id' => (string) $existing_id,
+        'total_chunks' => $total_chunks,
+        'received_chunks' => count($received_indices),
+        'received_indices' => $received_indices,
+        'resumed' => true,
+      ));
+    }
+
+    if ($sessions_changed) {
+      update_option('wpdock_upload_sessions', $sessions, false);
+    }
+  }
+
+  if ($single_file_mode) {
+    wpdock_assert_upload_free_space($total_bytes, $chunk_size, $concurrency, 0);
+  }
+
+  $upload_id = bin2hex(random_bytes(16));
+  $chunk_dir = WPDOCK_TEMP_DIR . '/chunks-' . $upload_id;
+  error_clear_last();
+  if (! wp_mkdir_p($chunk_dir)) {
+    wpdock_json_error(
+      'Cannot create chunk directory' . wpdock_last_error_suffix() .
+      ' (disk full or hosting quota exceeded?)',
+      500
+    );
+  }
+
+  $target_path = '';
+  if ($single_file_mode) {
+    $target_path = $chunk_dir . '/upload.part';
+    error_clear_last();
+    $target = @fopen($target_path, 'c+b');
+    if (! $target) {
+      wpdock_json_error(
+        'Cannot create destination file in temp directory' . wpdock_last_error_suffix(),
+        500
+      );
+    }
+    fclose($target);
+  }
+
   $sessions[$upload_id] = array(
     'dir' => $chunk_dir,
+    'target' => $target_path,
+    'write_mode' => $single_file_mode ? 'single_file' : 'chunks',
+    'resume_key' => $resume_key,
     'filename' => $filename,
     'total_chunks' => $total_chunks,
+    'total_bytes' => $total_bytes,
+    'chunk_size' => $chunk_size,
     'received' => array(),
-    'expires' => time() + (2 * HOUR_IN_SECONDS),
+    'expires' => time() + DAY_IN_SECONDS,
   );
   update_option('wpdock_upload_sessions', $sessions, false);
 
   wpdock_json_success(array(
     'upload_id' => $upload_id,
     'total_chunks' => $total_chunks,
+    'received_chunks' => 0,
+    'received_indices' => array(),
+    'resumed' => false,
   ));
 }
 
 function wpdock_upload_chunk(): void
 {
+  @set_time_limit(0);
+
   $upload_id = sanitize_text_field((string) ($_POST['upload_id'] ?? ''));
   $chunk_index = isset($_POST['chunk_index']) ? (int) $_POST['chunk_index'] : -1;
 
@@ -987,11 +1312,12 @@ function wpdock_upload_chunk(): void
   $session = $sessions[$upload_id];
   if (($session['expires'] ?? 0) < time()) {
     wpdock_delete_upload_session($upload_id, $sessions, true);
+    update_option('wpdock_upload_sessions', $sessions, false);
     wpdock_json_error('Upload session expired', 410);
   }
 
   if (empty($_FILES['chunk']) || $_FILES['chunk']['error'] !== UPLOAD_ERR_OK) {
-    wpdock_json_error('Chunk upload failed', 400);
+    wpdock_json_error('Chunk upload failed (PHP upload error ' . (int) ($_FILES['chunk']['error'] ?? -1) . ')', 400);
   }
 
   $chunk_dir = (string) ($session['dir'] ?? '');
@@ -999,19 +1325,50 @@ function wpdock_upload_chunk(): void
     wpdock_json_error('Upload session storage missing', 500);
   }
 
-  $chunk_path = $chunk_dir . '/chunk-' . str_pad((string) $chunk_index, 6, '0', STR_PAD_LEFT) . '.part';
-  if (! move_uploaded_file($_FILES['chunk']['tmp_name'], $chunk_path)) {
-    wpdock_json_error('Cannot store uploaded chunk', 500);
+  $mode = (string) ($session['write_mode'] ?? 'chunks');
+  $chunk_size = max(0, (int) ($session['chunk_size'] ?? 0));
+  $tmp_name = (string) $_FILES['chunk']['tmp_name'];
+  $uploaded_size = (int) ($_FILES['chunk']['size'] ?? 0);
+
+  if ($mode === 'single_file' && ! empty($session['target']) && $chunk_size > 0) {
+    $target_path = (string) $session['target'];
+    $written = wpdock_write_uploaded_chunk_at_offset($tmp_name, $target_path, $chunk_index, $chunk_size);
+    if ($written < 0 || ($uploaded_size > 0 && $written !== $uploaded_size)) {
+      wpdock_json_error(wpdock_chunk_storage_error_message('Failed to write chunk data'), 507);
+    }
+    @unlink($tmp_name);
+    $marker = wpdock_received_marker_path($chunk_dir, $chunk_index);
+    if (@file_put_contents($marker, (string) $written) === false) {
+      wpdock_json_error(wpdock_chunk_storage_error_message('Failed to mark uploaded chunk'), 507);
+    }
+  } else {
+    $chunk_path = $chunk_dir . '/chunk-' . str_pad((string) $chunk_index, 6, '0', STR_PAD_LEFT) . '.part';
+    if (! move_uploaded_file($tmp_name, $chunk_path)) {
+      wpdock_json_error(wpdock_chunk_storage_error_message('Cannot store uploaded chunk'), 500);
+    }
   }
 
-  if (! isset($session['received']) || ! is_array($session['received'])) {
-    $session['received'] = array();
+  if ($mode === 'single_file') {
+    // Marker files are concurrency-safe; the option only keeps session metadata
+    // and sliding expiry. This avoids lost "received" entries under parallel
+    // requests racing update_option().
+    unset($session['received']);
+  } else {
+    if (! isset($session['received']) || ! is_array($session['received'])) {
+      $session['received'] = array();
+    }
+    $session['received'][(string) $chunk_index] = 1;
   }
-  $session['received'][(string) $chunk_index] = 1;
+  // Sliding TTL: preserve failed/interrupted uploads long enough for the user to
+  // hit Push again and resume from already stored chunks. Idle sessions still get
+  // garbage-collected by cron.
+  $session['expires'] = time() + DAY_IN_SECONDS;
   $sessions[$upload_id] = $session;
   update_option('wpdock_upload_sessions', $sessions, false);
 
-  $received_count = count($session['received']);
+  $received_count = $mode === 'single_file'
+    ? wpdock_count_received_markers($chunk_dir)
+    : count($session['received']);
   $total_chunks = (int) ($session['total_chunks'] ?? 0);
 
   wpdock_json_success(array(
@@ -1021,8 +1378,114 @@ function wpdock_upload_chunk(): void
   ));
 }
 
+function wpdock_upload_abort(): void
+{
+  $body = json_decode(file_get_contents('php://input'), true);
+  if (! is_array($body)) {
+    wpdock_json_error('Invalid upload abort payload', 400);
+  }
+
+  $upload_id = sanitize_text_field((string) ($body['upload_id'] ?? ''));
+  if ($upload_id === '') {
+    wpdock_json_error('upload_id is required', 400);
+  }
+
+  $sessions = get_option('wpdock_upload_sessions', array());
+  if (isset($sessions[$upload_id])) {
+    wpdock_delete_upload_session($upload_id, $sessions, true);
+    update_option('wpdock_upload_sessions', $sessions, false);
+  }
+
+  wpdock_json_success(array('aborted' => true));
+}
+
+function wpdock_cleanup_uploads(): void
+{
+  @set_time_limit(0);
+
+  wpdock_ensure_temp_dir();
+
+  $deleted_sessions = 0;
+  $deleted_tokens = 0;
+  $deleted_files = 0;
+  $deleted_bytes = 0;
+
+  $sessions = get_option('wpdock_upload_sessions', array());
+  if (is_array($sessions) && ! empty($sessions)) {
+    foreach (array_keys($sessions) as $upload_id) {
+      $before = wpdock_dir_size((string) ($sessions[$upload_id]['dir'] ?? ''));
+      wpdock_delete_upload_session((string) $upload_id, $sessions, true);
+      $deleted_sessions++;
+      $deleted_bytes += $before;
+    }
+    update_option('wpdock_upload_sessions', $sessions, false);
+  }
+
+  // Completed resumable push uploads: remove their token payloads too, so the
+  // already uploaded ZIP/SQL disappears when the user decides not to continue.
+  $completed = get_option('wpdock_completed_uploads', array());
+  if (is_array($completed) && ! empty($completed)) {
+    foreach ($completed as $data) {
+      $token = is_array($data) ? (string) ($data['token'] ?? '') : '';
+      $removed = wpdock_delete_token_payload($token);
+      if ($removed['token_deleted']) {
+        $deleted_tokens++;
+      }
+      $deleted_files += $removed['files_deleted'];
+      $deleted_bytes += $removed['bytes_deleted'];
+    }
+    delete_option('wpdock_completed_uploads');
+  }
+
+  // Direct/chunk-finalized upload payloads that are still waiting behind tok-*.json.
+  // Limit this to files named upload-*.zip/sql so pack parts and DB export tokens
+  // used by Pull are not removed.
+  $tok_files = glob(WPDOCK_TEMP_DIR . '/tok-*.json');
+  if (is_array($tok_files)) {
+    foreach ($tok_files as $tok_file) {
+      $data = wpdock_read_json_array($tok_file);
+      $path = is_array($data) ? (string) ($data['path'] ?? '') : '';
+      $base = basename($path);
+      if ($path !== '' && preg_match('/^upload-.*\\.(zip|sql)$/i', $base)) {
+        $token = preg_replace('/^tok-([a-f0-9]+)\\.json$/i', '$1', basename((string) $tok_file));
+        $removed = wpdock_delete_token_payload((string) $token);
+        if ($removed['token_deleted']) {
+          $deleted_tokens++;
+        }
+        $deleted_files += $removed['files_deleted'];
+        $deleted_bytes += $removed['bytes_deleted'];
+      }
+    }
+  }
+
+  // Safety sweep: remove orphan chunk directories not referenced by any session.
+  $chunk_dirs = glob(WPDOCK_TEMP_DIR . '/chunks-*');
+  if (is_array($chunk_dirs)) {
+    foreach ($chunk_dirs as $dir) {
+      if (! is_dir($dir)) {
+        continue;
+      }
+      $before = wpdock_dir_size((string) $dir);
+      if (wpdock_rmdir_recursive((string) $dir)) {
+        $deleted_files++;
+        $deleted_bytes += $before;
+      }
+    }
+  }
+
+  wpdock_json_success(array(
+    'sessions_deleted' => $deleted_sessions,
+    'tokens_deleted' => $deleted_tokens,
+    'files_deleted' => $deleted_files,
+    'bytes_deleted' => $deleted_bytes,
+    'bytes_deleted_human' => wpdock_format_bytes((int) $deleted_bytes),
+  ));
+}
+
 function wpdock_upload_finalize(): void
 {
+  @set_time_limit(0);
+
   $body = json_decode(file_get_contents('php://input'), true);
   if (! is_array($body)) {
     wpdock_json_error('Invalid upload finalize payload', 400);
@@ -1041,6 +1504,7 @@ function wpdock_upload_finalize(): void
   $session = $sessions[$upload_id];
   if (($session['expires'] ?? 0) < time()) {
     wpdock_delete_upload_session($upload_id, $sessions, true);
+    update_option('wpdock_upload_sessions', $sessions, false);
     wpdock_json_error('Upload session expired', 410);
   }
 
@@ -1053,6 +1517,61 @@ function wpdock_upload_finalize(): void
 
   $ext = strtolower(pathinfo($filename, PATHINFO_EXTENSION));
   $dest = WPDOCK_TEMP_DIR . '/upload-' . time() . '-' . wp_generate_password(6, false, false) . '.' . $ext;
+
+  if ((string) ($session['write_mode'] ?? 'chunks') === 'single_file' && ! empty($session['target'])) {
+    $target_path = (string) $session['target'];
+    if (! file_exists($target_path)) {
+      wpdock_json_error('Assembled upload file is missing', 500);
+    }
+    for ($i = 0; $i < $total_chunks; $i++) {
+      if (! file_exists(wpdock_received_marker_path($chunk_dir, $i))) {
+        wpdock_json_error('Missing chunk #' . $i, 409);
+      }
+    }
+
+    $total_bytes = max(0, (int) ($session['total_bytes'] ?? 0));
+    if ($total_bytes > 0 && (int) filesize($target_path) !== $total_bytes) {
+      wpdock_json_error(
+        'Assembled upload size mismatch: expected ' . wpdock_format_bytes($total_bytes) .
+        ', got ' . wpdock_format_bytes((int) filesize($target_path)),
+        409
+      );
+    }
+
+    // Size alone cannot detect a corrupted chunk of the right length; verify the
+    // full-file hash the client embedded in the resume key before handing out a
+    // token, otherwise corruption only surfaces later as CRC errors in extract.
+    $expected_sha = wpdock_resume_key_sha256((string) ($session['resume_key'] ?? ''));
+    if ($expected_sha !== '') {
+      $actual_sha = @hash_file('sha256', $target_path);
+      if (is_string($actual_sha) && strtolower($actual_sha) !== $expected_sha) {
+        wpdock_delete_upload_session($upload_id, $sessions, true);
+        update_option('wpdock_upload_sessions', $sessions, false);
+        error_log('[WPDock] upload_finalize sha256 mismatch expected=' . $expected_sha . ' actual=' . $actual_sha);
+        wpdock_json_error(
+          'Assembled upload sha256 mismatch — data corrupted in transit, upload session reset',
+          409
+        );
+      }
+    }
+
+    if (! @rename($target_path, $dest)) {
+      wpdock_json_error(wpdock_chunk_storage_error_message('Cannot finalize assembled upload'), 507);
+    }
+    wpdock_rmdir_recursive($chunk_dir);
+    unset($sessions[$upload_id]);
+    update_option('wpdock_upload_sessions', $sessions, false);
+
+    $token = wpdock_store_temp_file($dest, DAY_IN_SECONDS);
+    wpdock_store_completed_upload((string) ($session['resume_key'] ?? ''), $token);
+    wpdock_json_success(array(
+      'file_token' => $token,
+      'file_size' => file_exists($dest) ? (int) filesize($dest) : 0,
+      'filename' => $filename,
+      'storage' => 'single_file',
+    ));
+  }
+
   $out = fopen($dest, 'wb');
   if (! $out) {
     wpdock_json_error('Cannot create destination file', 500);
@@ -1082,7 +1601,13 @@ function wpdock_upload_finalize(): void
         wpdock_json_error('Failed to read chunk data', 500);
       }
       if ($buf !== '') {
-        fwrite($out, $buf);
+        $written = fwrite($out, $buf);
+        if ($written === false || $written !== strlen($buf)) {
+          fclose($in);
+          fclose($out);
+          @unlink($dest);
+          wpdock_json_error(wpdock_chunk_storage_error_message('Cannot assemble uploaded chunks'), 507);
+        }
       }
     }
     fclose($in);
@@ -1090,15 +1615,33 @@ function wpdock_upload_finalize(): void
   }
 
   fclose($out);
+
+  $expected_sha = wpdock_resume_key_sha256((string) ($session['resume_key'] ?? ''));
+  if ($expected_sha !== '') {
+    $actual_sha = @hash_file('sha256', $dest);
+    if (is_string($actual_sha) && strtolower($actual_sha) !== $expected_sha) {
+      @unlink($dest);
+      wpdock_delete_upload_session($upload_id, $sessions, true);
+      update_option('wpdock_upload_sessions', $sessions, false);
+      error_log('[WPDock] upload_finalize sha256 mismatch expected=' . $expected_sha . ' actual=' . $actual_sha);
+      wpdock_json_error(
+        'Assembled upload sha256 mismatch — data corrupted in transit, upload session reset',
+        409
+      );
+    }
+  }
+
   @rmdir($chunk_dir);
   unset($sessions[$upload_id]);
   update_option('wpdock_upload_sessions', $sessions, false);
 
-  $token = wpdock_store_temp_file($dest);
+  $token = wpdock_store_temp_file($dest, DAY_IN_SECONDS);
+  wpdock_store_completed_upload((string) ($session['resume_key'] ?? ''), $token);
   wpdock_json_success(array(
     'file_token' => $token,
     'file_size' => file_exists($dest) ? (int) filesize($dest) : 0,
     'filename' => $filename,
+    'storage' => 'chunk_files',
   ));
 }
 
@@ -1127,6 +1670,38 @@ function wpdock_rmdir_recursive(string $dir): bool
   return $ok;
 }
 
+function wpdock_normalize_zip_entry_name(string $name): string
+{
+  $rel = str_replace('\\', '/', $name);
+  $rel = preg_replace('#/+#', '/', $rel) ?: $rel;
+  return ltrim($rel, '/');
+}
+
+function wpdock_is_safe_zip_entry_name(string $rel): bool
+{
+  if ($rel === '' || strpbrk($rel, "\0\t\n\r") !== false) {
+    return false;
+  }
+  if (preg_match('/^[A-Za-z]:/', $rel) || strpos($rel, '://') !== false) {
+    return false;
+  }
+  $segments = explode('/', trim($rel, '/'));
+  foreach ($segments as $segment) {
+    if ($segment === '' || $segment === '.' || $segment === '..') {
+      return false;
+    }
+  }
+  return true;
+}
+
+function wpdock_is_protected_extract_path(string $rel): bool
+{
+  $lower = strtolower(ltrim(str_replace('\\', '/', $rel), '/'));
+  return $lower === 'wp-content/plugins/wpdock-agent.php' ||
+    $lower === 'wp-content/plugins/wpdock-agent' ||
+    strpos($lower, 'wp-content/plugins/wpdock-agent/') === 0;
+}
+
 function wpdock_extract_files(): void
 {
   // Allow long-running extraction without PHP timeout / memory exhaustion.
@@ -1146,96 +1721,112 @@ function wpdock_extract_files(): void
     wpdock_json_error('Cannot open ZIP file', 500);
   }
 
-  // Protected paths — never overwrite the WPDock agent plugin itself.
-  $protected_prefixes = array(
-    'wp-content/plugins/wpdock-agent/',
-    'wp-content/plugins/wpdock-agent.php',
-  );
+  // ── Strategy: extract entries directly to ABSPATH ────────────────────────
+  // Older code extracted the whole ZIP into wp-content/wpdock-temp and then
+  // copied files into ABSPATH. On large split-push parts this required roughly
+  // zip + uncompressed temp + final destination space, so shared hosts failed
+  // halfway through with "ZIP extractTo() failed" despite the final overwrite
+  // fitting. Per-entry extractTo() keeps the robust ZipArchive path for deflated
+  // entries but avoids the extra temporary uncompressed copy.
+  $abspath = rtrim(str_replace('\\', '/', ABSPATH), '/') . '/';
 
-  // ── Strategy: extractTo() into a temp dir, then copy to ABSPATH ─────────
-  // ZipArchive::getStream() is unreliable on shared hosts for compressed entries
-  // (returns false for deflated files on some PHP builds).  Using extractTo()
-  // + recursive copy is far more robust and handles all compression methods.
-  $tmp_dir = WPDOCK_TEMP_DIR . '/extract-' . time() . '-' . wp_generate_password(8, false, false);
-  wp_mkdir_p($tmp_dir);
+  $skipped         = 0;
+  $skipped_unsafe  = 0;
+  $extracted       = 0;
+  $failed          = 0;
+  $failed_samples  = array();
+  $last_zip_status = '';
 
-  if (! $zip->extractTo($tmp_dir)) {
-    $zip->close();
-    wpdock_rmdir_recursive($tmp_dir);
-    @unlink($file);
-    wpdock_remove_token($token);
-    wpdock_json_error('ZIP extractTo() failed — check disk space and permissions', 500);
-  }
-
-  $zip->close();
-  @unlink($file);
-  wpdock_remove_token($token);
-
-  // ── Copy from temp dir to ABSPATH, skipping protected paths ─────────────
-  $abspath   = rtrim(str_replace('\\', '/', ABSPATH), '/') . '/';
-  $tmp_norm  = rtrim(str_replace('\\', '/', realpath($tmp_dir) ?: $tmp_dir), '/');
-
-  $skipped   = 0;
-  $extracted = 0;
-  $failed    = 0;
-
-  $iter = new RecursiveIteratorIterator(
-    new RecursiveDirectoryIterator($tmp_dir, RecursiveDirectoryIterator::SKIP_DOTS),
-    RecursiveIteratorIterator::SELF_FIRST
-  );
-
-  foreach ($iter as $item) {
-    $real = str_replace('\\', '/', $item->getRealPath());
-    $rel  = ltrim(substr($real, strlen($tmp_norm)), '/');
-
-    // Check protected prefixes.
-    $skip = false;
-    foreach ($protected_prefixes as $prefix) {
-      if (stripos($rel, $prefix) === 0) {
-        $skip = true;
-        break;
-      }
+  for ($i = 0; $i < $zip->numFiles; $i++) {
+    $name = $zip->getNameIndex($i);
+    if (! is_string($name) || $name === '') {
+      $skipped_unsafe++;
+      continue;
     }
-    if ($skip) {
+
+    $raw_name = str_replace('\\', '/', $name);
+    if (strpos($raw_name, '/') === 0 || preg_match('/^[A-Za-z]:/', $raw_name)) {
+      $skipped_unsafe++;
+      error_log('[WPDock] extract_files SKIP_UNSAFE rel=' . $raw_name);
+      continue;
+    }
+
+    $rel = wpdock_normalize_zip_entry_name($name);
+    if (! wpdock_is_safe_zip_entry_name($rel)) {
+      $skipped_unsafe++;
+      error_log('[WPDock] extract_files SKIP_UNSAFE rel=' . $rel);
+      continue;
+    }
+
+    if (wpdock_is_protected_extract_path($rel)) {
       $skipped++;
       continue;
     }
 
     $dest = $abspath . $rel;
-
-    if ($item->isDir()) {
-      if (! is_dir($dest)) {
-        wp_mkdir_p($dest);
+    if (substr($rel, -1) === '/') {
+      if (! is_dir($dest) && ! wp_mkdir_p($dest)) {
+        $failed++;
+        if (count($failed_samples) < 5) { $failed_samples[] = $rel; }
+        error_log('[WPDock] extract_files MKDIR_FAIL rel=' . $rel . ' dest=' . $dest);
       }
       continue;
     }
 
     $dir = dirname($dest);
-    if (! is_dir($dir)) {
-      wp_mkdir_p($dir);
+    if (! is_dir($dir) && ! wp_mkdir_p($dir)) {
+      $failed++;
+      if (count($failed_samples) < 5) { $failed_samples[] = $rel; }
+      error_log('[WPDock] extract_files MKDIR_FAIL rel=' . $rel . ' dir=' . $dir);
+      continue;
     }
 
-    if (copy($item->getRealPath(), $dest)) {
+    if ($zip->extractTo($abspath, array($name))) {
       $extracted++;
     } else {
       $failed++;
-      error_log('[WPDock] extract_files COPY_FAIL rel=' . $rel . ' dest=' . $dest);
+      // Distinguishes CRC errors (corrupted archive) from filesystem/permission
+      // failures — extractTo() itself reports both identically.
+      $last_zip_status = (string) $zip->getStatusString();
+      if (count($failed_samples) < 5) { $failed_samples[] = $rel; }
+      error_log('[WPDock] extract_files EXTRACT_FAIL rel=' . $rel . ' dest=' . $dest . ' status=' . $last_zip_status);
     }
   }
-
-  wpdock_rmdir_recursive($tmp_dir);
 
   error_log(
     '[WPDock] extract_files done: extracted=' . $extracted .
       ' skipped=' . $skipped .
+      ' skipped_unsafe=' . $skipped_unsafe .
       ' failed=' . $failed
   );
+
+  $zip->close();
+
+  if ($failed > 0) {
+    $free = @disk_free_space($abspath);
+    $free_msg = is_numeric($free) ? ' free=' . wpdock_format_bytes((int) $free) : '';
+    $status_msg = $last_zip_status !== '' ? ' zip_status=' . $last_zip_status : '';
+    // Keep the uploaded archive and its token: extraction is idempotent, so the
+    // client can retry extract_files (or resume a whole push via resume_key)
+    // without re-uploading hundreds of megabytes. The cleanup cron removes the
+    // temp file when the token expires.
+    wpdock_json_error(
+      'ZIP direct extract failed for ' . $failed . ' file(s)' . $free_msg . $status_msg .
+        ' — check permissions on the failed paths. Samples: ' . implode(', ', $failed_samples),
+      500
+    );
+  }
+
+  @unlink($file);
+  wpdock_remove_token($token);
 
   wpdock_json_success(array(
     'extracted'         => true,
     'files_extracted'   => $extracted,
     'skipped_protected' => $skipped,
+    'skipped_unsafe'    => $skipped_unsafe,
     'failed'            => $failed,
+    'method'            => 'direct',
   ));
 }
 
@@ -1255,9 +1846,14 @@ function wpdock_import_db(): void
   }
 
   global $wpdb;
-  $sql_size = filesize($file);
-  $sql      = file_get_contents($file);
-  if ($sql === false || trim($sql) === '') {
+  // The dump can be 100+ MB while shared hosts cap memory_limit at 256M —
+  // never load the whole file into memory. Everything below streams it
+  // line by line: one scan pass here, then the statement-by-statement import.
+  @ini_set('memory_limit', '512M');
+  @set_time_limit(0);
+  $sql_size = (int) filesize($file);
+  $scan     = wpdock_scan_sql_dump($file);
+  if ($sql_size === 0 || ! $scan['has_content']) {
     error_log('[WPDock] import_db ERROR: SQL dump is empty file=' . $file);
     wpdock_json_error('SQL dump is empty', 400);
   }
@@ -1282,12 +1878,7 @@ function wpdock_import_db(): void
     'links',
   );
 
-  preg_match_all(
-    '/CREATE\s+TABLE\s+(?:IF\s+NOT\s+EXISTS\s+)?`([^`]+)`/i',
-    $sql,
-    $tbl_matches
-  );
-  $dump_tables   = array_values(array_unique((array) ($tbl_matches[1] ?? array())));
+  $dump_tables   = (array) $scan['tables'];
   $source_prefix = 'wp_'; // safe fallback
   $prefix_found  = false;
 
@@ -1319,14 +1910,13 @@ function wpdock_import_db(): void
 
   $remote_prefix = (string) ($wpdb->prefix ?? 'wp_');
 
-  // If the dump prefix differs from the remote prefix, rewrite all backtick-quoted
-  // table names in the SQL so CREATE/INSERT/DROP all target the correct prefix.
+  // If the dump prefix differs from the remote prefix, all backtick-quoted
+  // table names are rewritten per statement inside wpdock_import_sql_file().
   if ($source_prefix !== $remote_prefix) {
     error_log(
       '[WPDock] import_db prefix mismatch: dump=' . $source_prefix .
-        ' remote=' . $remote_prefix . ' — rewriting SQL table names'
+        ' remote=' . $remote_prefix . ' — table names rewritten during streaming import'
     );
-    $sql = str_replace('`' . $source_prefix, '`' . $remote_prefix, $sql);
   }
 
   // ── Snapshot remote credentials (before wipe) ────────────────────────────
@@ -1433,10 +2023,8 @@ function wpdock_import_db(): void
   }
   // ─────────────────────────────────────────────────────────────────────────
 
-  // Count CREATE TABLE statements to know what to expect
-  preg_match_all('/CREATE\s+TABLE/i', $sql, $ct_matches);
-  $expected_tables = count($ct_matches[0]);
-  $sql_preview     = substr(preg_replace('/\s+/', ' ', $sql), 0, 200);
+  $expected_tables = count($dump_tables);
+  $sql_preview     = (string) $scan['preview'];
   error_log('[WPDock] import_db START file_size=' . $sql_size .
     ' source_prefix=' . $source_prefix .
     ' remote_prefix=' . $remote_prefix .
@@ -1444,7 +2032,7 @@ function wpdock_import_db(): void
     ' expected_tables=' . $expected_tables .
     ' sql_preview=' . $sql_preview);
 
-  $result = wpdock_import_sql($sql);
+  $result = wpdock_import_sql_file($file, $source_prefix, $remote_prefix);
 
   @unlink($file);
   wpdock_remove_token($token);
@@ -1669,58 +2257,57 @@ function wpdock_import_db(): void
   ));
 }
 
-function wpdock_import_sql(string $sql): array
+/**
+ * First streaming pass over the dump: collects CREATE TABLE names, a short
+ * preview and whether the file has any non-whitespace content at all.
+ * Memory footprint: one line at a time, never the whole file.
+ */
+function wpdock_scan_sql_dump(string $file): array
 {
-  $mysqli_result = wpdock_import_db_via_mysqli($sql);
-  if ($mysqli_result['success']) {
-    return $mysqli_result;
+  $tables      = array();
+  $preview     = '';
+  $has_content = false;
+
+  $fh = @fopen($file, 'rb');
+  if (! $fh) {
+    return array('tables' => array(), 'preview' => '', 'has_content' => false);
   }
 
-  $wpdb_result = wpdock_import_db_via_wpdb($sql);
-  if ($wpdb_result['success']) {
-    $warnings = array();
-    if (! empty($mysqli_result['error'])) {
-      $warnings[] = 'mysqli fallback: ' . $mysqli_result['error'];
+  while (($line = fgets($fh)) !== false) {
+    if (trim($line) === '') {
+      continue;
     }
-    $wpdb_result['warnings'] = $warnings;
-    return $wpdb_result;
+    $has_content = true;
+    if (strlen($preview) < 200) {
+      $preview .= preg_replace('/\s+/', ' ', $line);
+    }
+    if (preg_match('/CREATE\s+TABLE\s+(?:IF\s+NOT\s+EXISTS\s+)?`([^`]+)`/i', $line, $m)) {
+      $tables[] = $m[1];
+    }
   }
+  fclose($fh);
 
   return array(
-    'success' => false,
-    'method' => 'failed',
-    'error' => trim(
-      'mysqli: ' . (string) ($mysqli_result['error'] ?? 'unknown') .
-        ' | wpdb: ' . (string) ($wpdb_result['error'] ?? 'unknown')
-    ),
+    'tables'      => array_values(array_unique($tables)),
+    'preview'     => substr($preview, 0, 200),
+    'has_content' => $has_content,
   );
 }
 
-function wpdock_import_db_via_mysqli(string $sql): array
+/**
+ * Opens a dedicated mysqli connection using WP's DB constants.
+ * Returns a mysqli instance on success, or an error string on failure.
+ */
+function wpdock_mysqli_connect()
 {
   if (! function_exists('mysqli_init')) {
-    error_log('[WPDock] mysqli import SKIP: extension unavailable');
-    return array(
-      'success' => false,
-      'method' => 'mysqli',
-      'error' => 'mysqli extension is unavailable',
-    );
+    return 'mysqli extension is unavailable';
   }
 
   $parsed = wpdock_parse_db_host(DB_HOST);
-  error_log('[WPDock] mysqli import CONNECT host=' . ($parsed['host'] ?? '?') .
-    ' port=' . ($parsed['port'] ?? 0) .
-    ' user=' . DB_USER . ' db=' . DB_NAME .
-    ' sql_len=' . strlen($sql));
-
   $mysqli = mysqli_init();
   if (! $mysqli) {
-    error_log('[WPDock] mysqli import ERROR: mysqli_init() failed');
-    return array(
-      'success' => false,
-      'method' => 'mysqli',
-      'error' => 'Cannot initialize mysqli',
-    );
+    return 'Cannot initialize mysqli';
   }
 
   mysqli_options($mysqli, MYSQLI_OPT_CONNECT_TIMEOUT, 30);
@@ -1736,61 +2323,143 @@ function wpdock_import_db_via_mysqli(string $sql): array
 
   if (! $connected) {
     $error = mysqli_connect_error() ?: 'Unknown mysqli connection error';
-    error_log('[WPDock] mysqli import CONNECT FAILED error=' . $error);
     mysqli_close($mysqli);
-    return array(
-      'success' => false,
-      'method' => 'mysqli',
-      'error' => $error,
-    );
+    return $error;
   }
-  error_log('[WPDock] mysqli import connected OK');
 
   @mysqli_set_charset($mysqli, 'utf8mb4');
+  return $mysqli;
+}
 
-  if (! @mysqli_multi_query($mysqli, $sql)) {
-    $error = mysqli_error($mysqli) ?: 'Unknown mysqli import error';
-    error_log('[WPDock] mysqli multi_query FAILED on start: ' . $error);
-    mysqli_close($mysqli);
+/**
+ * Streaming SQL import: reads the dump line by line, assembles statements
+ * (honouring the DELIMITER ;; blocks mysqldump emits around triggers and
+ * routines) and executes them one at a time. Peak memory = the largest single
+ * statement (~net_buffer_length), not the whole file — a 100+ MB dump imports
+ * fine under a 256M memory_limit. Prefix rewrite `from_prefix → `to_prefix is
+ * applied per statement. Uses a dedicated mysqli connection when available so
+ * dump session settings (FOREIGN_KEY_CHECKS, SQL_MODE, NAMES) stick; falls
+ * back to $wpdb otherwise. Safe for line-based parsing because mysqldump
+ * always escapes newlines inside string literals.
+ */
+function wpdock_import_sql_file(string $file, string $from_prefix, string $to_prefix): array
+{
+  global $wpdb;
+
+  $fh = @fopen($file, 'rb');
+  if (! $fh) {
     return array(
       'success' => false,
-      'method' => 'mysqli',
-      'error' => $error,
+      'method'  => 'stream',
+      'error'   => 'Cannot open SQL dump for reading',
     );
   }
 
+  $mysqli     = wpdock_mysqli_connect();
+  $use_mysqli = $mysqli instanceof mysqli;
+  $method     = $use_mysqli ? 'mysqli-stream' : 'wpdb-stream';
+  $warnings   = array();
+  if (! $use_mysqli) {
+    $warnings[] = 'mysqli unavailable (' . (string) $mysqli . ') — using wpdb';
+  }
+  error_log('[WPDock] stream import START method=' . $method .
+    ' rewrite=' . ($from_prefix !== $to_prefix ? $from_prefix . '->' . $to_prefix : 'no'));
+
+  $delimiter  = ';';
+  $buffer     = '';
   $statements = 0;
-  $last_error = '';
-  do {
-    $statements++;
-    $result = @mysqli_store_result($mysqli);
-    if ($result instanceof mysqli_result) {
-      mysqli_free_result($result);
-    }
-    $stmt_error = mysqli_error($mysqli);
-    if ($stmt_error !== '') {
-      error_log('[WPDock] mysqli stmt #' . $statements . ' error: ' . $stmt_error);
-      $last_error = $stmt_error;
-    }
-  } while (@mysqli_more_results($mysqli) && @mysqli_next_result($mysqli));
+  $skipped    = 0;
+  $error      = '';
 
-  $error = $last_error ?: mysqli_error($mysqli);
-  mysqli_close($mysqli);
+  while (($line = fgets($fh)) !== false) {
+    if ($buffer === '') {
+      $trimmed = trim($line);
+      // Skip blank lines and SQL comments between statements.
+      if ($trimmed === '' || strncmp($trimmed, '--', 2) === 0) {
+        continue;
+      }
+      // DELIMITER is a client directive, not a server statement.
+      if (preg_match('/^DELIMITER\s+(\S+)/i', $trimmed, $m)) {
+        $delimiter = $m[1];
+        continue;
+      }
+    }
+
+    $buffer .= $line;
+    $tail = rtrim($buffer);
+    $dlen = strlen($delimiter);
+    if (substr($tail, -$dlen) !== $delimiter) {
+      continue; // statement not finished yet
+    }
+
+    $query  = trim(substr($tail, 0, -$dlen));
+    $buffer = '';
+    if ($query === '') {
+      continue;
+    }
+    if ($from_prefix !== $to_prefix) {
+      $query = str_replace('`' . $from_prefix, '`' . $to_prefix, $query);
+    }
+
+    $exec_error = '';
+    if ($use_mysqli) {
+      if (! @mysqli_real_query($mysqli, $query)) {
+        $exec_error = mysqli_error($mysqli) ?: 'Unknown mysqli error';
+      } else {
+        $res = @mysqli_store_result($mysqli);
+        if ($res instanceof mysqli_result) {
+          mysqli_free_result($res);
+        }
+      }
+    } elseif ($wpdb->query($query) === false) { // phpcs:ignore WordPress.DB.PreparedSQL.NotPrepared
+      $exec_error = $wpdb->last_error ?: 'wpdb query failed';
+    }
+
+    if ($exec_error !== '') {
+      $preview = substr(preg_replace('/\s+/', ' ', $query), 0, 180);
+      if (wpdock_is_skippable_sql($query)) {
+        $skipped++;
+        $w = 'skipped: ' . $exec_error . ' near: ' . $preview;
+        $warnings[] = $w;
+        error_log('[WPDock] stream import ' . $w);
+        continue;
+      }
+      $error = $exec_error . ' near: ' . $preview;
+      error_log('[WPDock] stream import FATAL at statement #' . ($statements + 1) . ': ' . $error);
+      break;
+    }
+
+    $statements++;
+    if ($statements % 200 === 0) {
+      error_log('[WPDock] stream import progress statements=' . $statements . ' skipped=' . $skipped);
+    }
+  }
+
+  fclose($fh);
+  if ($use_mysqli) {
+    mysqli_close($mysqli);
+  }
+
   if ($error !== '') {
-    error_log('[WPDock] mysqli import FAILED after ' . $statements . ' statements: ' . $error);
     return array(
-      'success' => false,
-      'method' => 'mysqli',
-      'error' => $error,
+      'success'    => false,
+      'method'     => $method,
+      'error'      => $error,
       'statements' => $statements,
+      'skipped'    => $skipped,
+      'warnings'   => $warnings,
     );
   }
 
-  error_log('[WPDock] mysqli import SUCCESS statements=' . $statements);
+  error_log('[WPDock] stream import SUCCESS method=' . $method .
+    ' statements=' . $statements . ' skipped=' . $skipped .
+    ' warnings=' . count($warnings));
   return array(
-    'success' => true,
-    'method' => 'mysqli',
+    'success'    => true,
+    'method'     => $method,
     'statements' => $statements,
+    'skipped'    => $skipped,
+    'warnings'   => $warnings,
   );
 }
 
@@ -1823,67 +2492,6 @@ function wpdock_is_skippable_sql(string $q): bool
     return true;
   }
   return false;
-}
-
-function wpdock_import_db_via_wpdb(string $sql): array
-{
-  global $wpdb;
-
-  error_log('[WPDock] wpdb import START sql_len=' . strlen($sql));
-
-  // Split on ; followed by optional whitespace then newline-or-end
-  $queries  = preg_split('/;[ \t]*(?:\r?\n|$)/', $sql) ?: array();
-  $total_queries = count($queries);
-  $statements = 0;
-  $skipped    = 0;
-  $warnings   = array();
-
-  error_log('[WPDock] wpdb import query_count=' . $total_queries);
-
-  foreach ($queries as $i => $query) {
-    $query = trim((string) $query);
-    if ($query === '' || strncmp($query, '--', 2) === 0) {
-      continue;
-    }
-
-    $result = $wpdb->query($query); // phpcs:ignore WordPress.DB.PreparedSQL.NotPrepared
-    if ($result === false) {
-      $preview = substr(preg_replace('/\s+/', ' ', $query), 0, 180);
-      if (wpdock_is_skippable_sql($query)) {
-        // Non-critical mysqldump directive rejected by this host — skip.
-        $skipped++;
-        $w = 'skipped[' . $i . ']: ' . $preview;
-        $warnings[] = $w;
-        error_log('[WPDock] wpdb ' . $w);
-        continue;
-      }
-      $err = $wpdb->last_error ?: 'wpdb query failed';
-      error_log('[WPDock] wpdb import FATAL at query[' . $i . '] error=' . $err . ' query=' . $preview);
-      return array(
-        'success'    => false,
-        'method'     => 'wpdb',
-        'error'      => $err . ' near: ' . $preview,
-        'statements' => $statements,
-        'skipped'    => $skipped,
-        'warnings'   => $warnings,
-      );
-    }
-
-    $statements++;
-    // Log every 100th statement so we can see progress
-    if ($statements % 100 === 0) {
-      error_log('[WPDock] wpdb import progress statements=' . $statements . ' skipped=' . $skipped);
-    }
-  }
-
-  error_log('[WPDock] wpdb import SUCCESS statements=' . $statements . ' skipped=' . $skipped . ' warnings=' . count($warnings));
-  return array(
-    'success'    => true,
-    'method'     => 'wpdb',
-    'statements' => $statements,
-    'skipped'    => $skipped,
-    'warnings'   => $warnings,
-  );
 }
 
 function wpdock_parse_db_host(string $db_host): array
@@ -1934,6 +2542,213 @@ function wpdock_download_file(): void
 
 // ── Token/temp file helpers ───────────────────────────────────────────────────
 
+function wpdock_sanitize_resume_key(string $key): string
+{
+  $key = preg_replace('/[^a-zA-Z0-9._:-]/', '', $key);
+  return substr((string) $key, 0, 220);
+}
+
+/**
+ * The extension builds resume keys as "sha256:<hex>:bytes:<n>:ext:<.ext>".
+ * Returns the expected file hash, or '' when the key carries none (older clients).
+ */
+function wpdock_resume_key_sha256(string $resume_key): string
+{
+  if (preg_match('/^sha256:([0-9a-fA-F]{64}):/', $resume_key, $m)) {
+    return strtolower($m[1]);
+  }
+  return '';
+}
+
+function wpdock_assert_upload_free_space(
+  int $total_bytes,
+  int $chunk_size,
+  int $concurrency,
+  int $received_bytes = 0
+): void {
+  if ($total_bytes <= 0 || $chunk_size <= 0) {
+    return;
+  }
+  $free = @disk_free_space(WPDOCK_TEMP_DIR);
+  if ($free === false) {
+    return;
+  }
+
+  // The single-file resumable path needs space only for bytes not yet written
+  // plus PHP's concurrent request temp files. Old all-.part uploads needed ~2x.
+  $remaining = max(0, $total_bytes - max(0, $received_bytes));
+  $tmp_headroom = $remaining > 0 ? min($remaining, $chunk_size * max(1, $concurrency)) : 0;
+  $required = $remaining + $tmp_headroom + (16 * 1024 * 1024);
+  if ($free < $required) {
+    wpdock_json_error(
+      'Insufficient server disk space for upload: need ' . wpdock_format_bytes($required) .
+      ' free, available ' . wpdock_format_bytes((int) $free),
+      507
+    );
+  }
+}
+
+function wpdock_upload_received_indices(array $session): array
+{
+  $indices = array();
+  $dir = (string) ($session['dir'] ?? '');
+  if ((string) ($session['write_mode'] ?? 'chunks') === 'single_file' && $dir !== '') {
+    $markers = glob($dir . '/received-*.ok');
+    if (is_array($markers)) {
+      foreach ($markers as $marker) {
+        if (preg_match('/received-(\d+)\.ok$/', basename((string) $marker), $m)) {
+          $indices[] = (int) $m[1];
+        }
+      }
+    }
+  } elseif (isset($session['received']) && is_array($session['received'])) {
+    foreach (array_keys($session['received']) as $idx) {
+      if (is_numeric($idx)) {
+        $indices[] = (int) $idx;
+      }
+    }
+  }
+
+  $indices = array_values(array_unique(array_filter($indices, static function ($i) {
+    return is_int($i) && $i >= 0;
+  })));
+  sort($indices, SORT_NUMERIC);
+  return $indices;
+}
+
+function wpdock_estimate_received_bytes(array $indices, int $total_chunks, int $chunk_size, int $total_bytes): int
+{
+  if ($chunk_size <= 0 || $total_chunks <= 0 || $total_bytes <= 0) {
+    return 0;
+  }
+  $bytes = 0;
+  foreach ($indices as $index) {
+    $index = (int) $index;
+    if ($index < 0 || $index >= $total_chunks) {
+      continue;
+    }
+    $start = $index * $chunk_size;
+    $bytes += min($chunk_size, max(0, $total_bytes - $start));
+  }
+  return min($bytes, $total_bytes);
+}
+
+function wpdock_format_bytes(int $bytes): string
+{
+  if ($bytes < 1024) {
+    return $bytes . ' B';
+  }
+  if ($bytes < 1048576) {
+    return round($bytes / 1024, 1) . ' KB';
+  }
+  if ($bytes < 1073741824) {
+    return round($bytes / 1048576, 1) . ' MB';
+  }
+  return round($bytes / 1073741824, 1) . ' GB';
+}
+
+function wpdock_chunk_storage_error_message(string $prefix): string
+{
+  $message = $prefix . wpdock_last_error_suffix();
+  $free = @disk_free_space(WPDOCK_TEMP_DIR);
+  if ($free === false) {
+    return $message;
+  }
+  return $message . ' (server free space: ' . wpdock_format_bytes((int) $free) . ')';
+}
+
+function wpdock_received_marker_path(string $chunk_dir, int $chunk_index): string
+{
+  return $chunk_dir . '/received-' . str_pad((string) $chunk_index, 6, '0', STR_PAD_LEFT) . '.ok';
+}
+
+function wpdock_count_received_markers(string $chunk_dir): int
+{
+  $markers = glob($chunk_dir . '/received-*.ok');
+  return is_array($markers) ? count($markers) : 0;
+}
+
+function wpdock_dir_size(string $dir): int
+{
+  if ($dir === '' || ! is_dir($dir)) {
+    return 0;
+  }
+  $total = 0;
+  try {
+    $items = new RecursiveIteratorIterator(
+      new RecursiveDirectoryIterator($dir, RecursiveDirectoryIterator::SKIP_DOTS)
+    );
+    foreach ($items as $item) {
+      if ($item->isFile()) {
+        $total += (int) $item->getSize();
+      }
+    }
+  } catch (Throwable $e) {
+    return 0;
+  }
+  return $total;
+}
+
+function wpdock_write_uploaded_chunk_at_offset(
+  string $tmp_name,
+  string $target_path,
+  int $chunk_index,
+  int $chunk_size
+): int {
+  error_clear_last();
+  $in = @fopen($tmp_name, 'rb');
+  if (! $in) {
+    return -1;
+  }
+
+  error_clear_last();
+  $out = @fopen($target_path, 'c+b');
+  if (! $out) {
+    fclose($in);
+    return -1;
+  }
+
+  $locked = @flock($out, LOCK_EX);
+  error_clear_last();
+  $ok = @fseek($out, $chunk_index * $chunk_size, SEEK_SET) === 0;
+  $written_total = 0;
+
+  while ($ok && ! feof($in)) {
+    error_clear_last();
+    $buf = fread($in, 1048576);
+    if ($buf === false) {
+      $ok = false;
+      break;
+    }
+    if ($buf === '') {
+      continue;
+    }
+    $offset = 0;
+    $length = strlen($buf);
+    while ($offset < $length) {
+      error_clear_last();
+      $written = fwrite($out, substr($buf, $offset));
+      if ($written === false || $written <= 0) {
+        $ok = false;
+        break 2;
+      }
+      $offset += $written;
+      $written_total += $written;
+    }
+  }
+
+  if (! @fflush($out)) {
+    $ok = false;
+  }
+  if ($locked) {
+    @flock($out, LOCK_UN);
+  }
+  fclose($out);
+  fclose($in);
+
+  return $ok ? $written_total : -1;
+}
+
 function wpdock_ensure_temp_dir(): void
 {
   if (! is_dir(WPDOCK_TEMP_DIR)) {
@@ -1942,6 +2757,44 @@ function wpdock_ensure_temp_dir(): void
     file_put_contents(WPDOCK_TEMP_DIR . '/.htaccess', "Deny from all\n");
     file_put_contents(WPDOCK_TEMP_DIR . '/index.php', '<?php // Silence is golden');
   }
+}
+
+/** ": <message>" of the last PHP error, or '' — for attaching the real cause
+ *  (quota exceeded, permission denied) to a failed filesystem call. */
+function wpdock_last_error_suffix(): string
+{
+  $last = error_get_last();
+  if (! is_array($last) || empty($last['message'])) {
+    return '';
+  }
+  return ': ' . $last['message'];
+}
+
+/** Real write probe of the temp dir, reported in `ping`. `is_writable()` and
+ *  `disk_free_space()` both pass on shared hosting with an exhausted account
+ *  quota (they see the partition, not the quota) — only an actual write fails,
+ *  so try one. Lets the client abort a push before minutes of packing. */
+function wpdock_temp_status(): array
+{
+  wpdock_ensure_temp_dir();
+  $probe = WPDOCK_TEMP_DIR . '/probe-' . bin2hex(random_bytes(4)) . '.tmp';
+  error_clear_last();
+  $writable = @file_put_contents($probe, 'ok') !== false;
+  $error = null;
+  if ($writable) {
+    @unlink($probe);
+  } else {
+    $error = ltrim(wpdock_last_error_suffix(), ': ');
+    if ($error === '') {
+      $error = 'write failed';
+    }
+  }
+  $free = @disk_free_space(WPDOCK_TEMP_DIR);
+  return array(
+    'temp_writable'   => $writable,
+    'temp_write_error' => $error,
+    'temp_free_bytes' => $free === false ? null : (int) $free,
+  );
 }
 
 /**
@@ -1961,15 +2814,42 @@ function wpdock_token_file(string $token): string
   return WPDOCK_TEMP_DIR . '/tok-' . $token . '.json';
 }
 
-function wpdock_store_temp_file(string $file_path): string
+function wpdock_store_temp_file(string $file_path, int $ttl = 3600): string
 {
   wpdock_ensure_temp_dir();
   $token = bin2hex(random_bytes(16));
-  wpdock_write_json_atomic(wpdock_token_file($token), array(
+  error_clear_last();
+  // A silently lost token surfaces later as an unexplained 404 on download —
+  // fail the originating request instead, with the real filesystem error.
+  if (! wpdock_write_json_atomic(wpdock_token_file($token), array(
     'path'    => $file_path,
-    'expires' => time() + 3600,
-  ));
+    'expires' => time() + max(60, $ttl),
+  ))) {
+    wpdock_json_error(
+      'Cannot store download token in wpdock-temp' . wpdock_last_error_suffix() .
+      ' (disk full or hosting quota exceeded?)',
+      500
+    );
+  }
   return $token;
+}
+
+function wpdock_store_completed_upload(string $resume_key, string $token): void
+{
+  $resume_key = wpdock_sanitize_resume_key($resume_key);
+  $token = preg_replace('/[^a-f0-9]/i', '', (string) $token);
+  if ($resume_key === '' || $token === '') {
+    return;
+  }
+  $completed = get_option('wpdock_completed_uploads', array());
+  if (! is_array($completed)) {
+    $completed = array();
+  }
+  $completed[$resume_key] = array(
+    'token' => $token,
+    'expires' => time() + DAY_IN_SECONDS,
+  );
+  update_option('wpdock_completed_uploads', $completed, false);
 }
 
 function wpdock_resolve_token(string $token): ?string
@@ -1994,6 +2874,41 @@ function wpdock_remove_token(string $token): void
   @unlink(wpdock_token_file($token));
 }
 
+function wpdock_delete_token_payload(string $token): array
+{
+  $token = preg_replace('/[^a-f0-9]/i', '', (string) $token);
+  if ($token === '') {
+    return array('token_deleted' => false, 'files_deleted' => 0, 'bytes_deleted' => 0);
+  }
+
+  $tok_file = wpdock_token_file($token);
+  $data = file_exists($tok_file) ? wpdock_read_json_array($tok_file) : null;
+  $path = is_array($data) ? (string) ($data['path'] ?? '') : '';
+  $files_deleted = 0;
+  $bytes_deleted = 0;
+
+  if ($path !== '' && file_exists($path)) {
+    if (is_dir($path)) {
+      $bytes_deleted = wpdock_dir_size($path);
+      if (wpdock_rmdir_recursive($path)) {
+        $files_deleted++;
+      }
+    } else {
+      $bytes_deleted = (int) @filesize($path);
+      if (@unlink($path)) {
+        $files_deleted++;
+      }
+    }
+  }
+
+  $token_deleted = file_exists($tok_file) ? @unlink($tok_file) : false;
+  return array(
+    'token_deleted' => (bool) $token_deleted,
+    'files_deleted' => $files_deleted,
+    'bytes_deleted' => $bytes_deleted,
+  );
+}
+
 function wpdock_delete_upload_session(string $upload_id, array &$sessions, bool $delete_chunks = false): void
 {
   if (! isset($sessions[$upload_id])) {
@@ -2003,13 +2918,7 @@ function wpdock_delete_upload_session(string $upload_id, array &$sessions, bool 
   $session = $sessions[$upload_id];
   $chunk_dir = (string) ($session['dir'] ?? '');
   if ($delete_chunks && $chunk_dir !== '' && is_dir($chunk_dir)) {
-    $files = glob($chunk_dir . '/*');
-    if (is_array($files)) {
-      foreach ($files as $file) {
-        @unlink($file);
-      }
-    }
-    @rmdir($chunk_dir);
+    wpdock_rmdir_recursive($chunk_dir);
   }
 
   unset($sessions[$upload_id]);
@@ -2264,7 +3173,14 @@ register_deactivation_hook(__FILE__, function () {
   wp_clear_scheduled_hook('wpdock_cleanup_temp');
 });
 
-add_action('wpdock_cleanup_temp', function () {
+/**
+ * Remove expired temp artifacts: tokens + payloads, upload sessions, stale
+ * pack files. Runs from the hourly cron AND opportunistically from ping,
+ * because WP-cron never fires on traffic-less staging sites — without visits
+ * the leftovers of failed pushes would otherwise live until the disk fills up.
+ */
+function wpdock_temp_sweep(): void
+{
   $now = time();
 
   // Per-file tokens (`tok-<token>.json`): drop expired ones plus their payload.
@@ -2292,6 +3208,17 @@ add_action('wpdock_cleanup_temp', function () {
     delete_option('wpdock_temp_tokens');
   }
 
+  $completed = get_option('wpdock_completed_uploads', array());
+  if (is_array($completed) && ! empty($completed)) {
+    foreach ($completed as $resume_key => $data) {
+      $token = is_array($data) ? (string) ($data['token'] ?? '') : '';
+      if (! is_array($data) || (int) ($data['expires'] ?? 0) < $now || ! wpdock_resolve_token($token)) {
+        unset($completed[$resume_key]);
+      }
+    }
+    update_option('wpdock_completed_uploads', $completed, false);
+  }
+
   $sessions = get_option('wpdock_upload_sessions', array());
   foreach ($sessions as $upload_id => $data) {
     if (($data['expires'] ?? 0) < $now) {
@@ -2310,4 +3237,17 @@ add_action('wpdock_cleanup_temp', function () {
       }
     }
   }
-});
+}
+
+add_action('wpdock_cleanup_temp', 'wpdock_temp_sweep');
+
+// Throttled wrapper for request-time calls (ping): at most one sweep per 15 min.
+function wpdock_maybe_temp_sweep(): void
+{
+  $last = (int) get_option('wpdock_last_temp_sweep', 0);
+  if (time() - $last < 15 * MINUTE_IN_SECONDS) {
+    return;
+  }
+  update_option('wpdock_last_temp_sweep', time(), false);
+  wpdock_temp_sweep();
+}

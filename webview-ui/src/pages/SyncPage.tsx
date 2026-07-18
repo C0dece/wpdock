@@ -39,7 +39,8 @@ export default function SyncPage({ remoteId, direction, localSiteId: routeLocalS
   const remote = remotes.find((r) => r.id === remoteId);
   const boundLocalSiteId = routeLocalSiteId ?? remote?.linkedSiteIds?.[0];
   const [localSiteId, setLocalSiteId] = useState(boundLocalSiteId ?? '');
-  const [includeDb, setIncludeDb] = useState(true);
+  const [includeDb, setIncludeDb] = useState(() => remote?.fileTransferMode === 'ftp' ? false : true);
+  const [syncMode, setSyncMode] = useState<'full' | 'incremental'>('incremental');
   const [skipUploads, setSkipUploads] = useState(false);
   const [devMode, setDevMode] = useState(false);
   const [preserveCredentials, setPreserveCredentials] = useState(true);
@@ -92,6 +93,9 @@ export default function SyncPage({ remoteId, direction, localSiteId: routeLocalS
         onToast(direction === 'pull' ? 'Pull завершён!' : 'Push завершён!', 'success');
       }
       if (msg.type === 'pullDiagnostic') setPullDiagnostic(msg.diagnostic ?? null);
+      if (msg.type === 'syncStateReset' && msg.remoteId === remoteId) {
+        onToast('Состояние sync сброшено — следующий Push/Pull перенесёт всё заново.', 'success');
+      }
       if (msg.type === 'error') {
         setSyncing(false);
         onToast(msg.message, 'error');
@@ -99,7 +103,7 @@ export default function SyncPage({ remoteId, direction, localSiteId: routeLocalS
     };
     window.addEventListener('message', handler);
     return () => window.removeEventListener('message', handler);
-  }, [direction, onToast]);
+  }, [direction, onToast, remoteId]);
 
   if (!remote) {
     return <div className="page"><div className="empty-state"><h3>Удалённый сайт не найден</h3></div></div>;
@@ -126,6 +130,7 @@ export default function SyncPage({ remoteId, direction, localSiteId: routeLocalS
         remoteId,
         localSiteId: selectedLocalSiteId,
         includeDb,
+        syncMode,
         skipUploads: isPull ? skipUploads : undefined,
         devMode: direction === 'push' ? devMode : undefined,
         preserveCredentials,
@@ -153,6 +158,8 @@ export default function SyncPage({ remoteId, direction, localSiteId: routeLocalS
         <div className="site-card-meta-row">
           <span className={`badge ${isPull ? 'badge-green' : 'badge-yellow'}`}>{isPull ? 'pull' : 'push'}</span>
           <span className="site-card-chip">{remote.name}</span>
+          <span className="site-card-chip">{remote.fileTransferMode === 'ftp' ? 'ftp' : 'agent'}</span>
+          <span className="site-card-chip">{syncMode === 'incremental' ? 'changed only' : 'full'}</span>
           <span className="site-card-chip">{includeDb ? 'with db' : 'files only'}</span>
           {isQuickPull && <span className="site-card-chip">quick</span>}
         </div>
@@ -160,9 +167,9 @@ export default function SyncPage({ remoteId, direction, localSiteId: routeLocalS
           <div className="overview-stat"><span className="overview-stat-value">{isPull ? '↓' : '↑'}</span><span className="overview-stat-label">mode</span></div>
           <div className="overview-stat"><span className="overview-stat-value">{boundLocalSiteId ?? localSiteId ? 'bound' : targetMode}</span><span className="overview-stat-label">target</span></div>
           <div className="overview-stat"><span className="overview-stat-value">{preserveCredentials ? 'keep' : 'replace'}</span><span className="overview-stat-label">creds</span></div>
-          <div className="overview-stat"><span className="overview-stat-value">{remote.agentInstalled ? 'agent' : 'no agent'}</span><span className="overview-stat-label">remote</span></div>
+          <div className="overview-stat"><span className="overview-stat-value">{remote.fileTransferMode === 'ftp' ? 'ftp' : (remote.agentInstalled ? 'agent' : 'no agent')}</span><span className="overview-stat-label">remote</span></div>
         </div>
-        {!remote.agentInstalled && (
+        {remote.fileTransferMode !== 'ftp' && !remote.agentInstalled && (
           <div className="card" style={{ borderColor: 'var(--yellow)' }}>
             <div className="section-copy">⚠ WPDock Agent не установлен. Для установки откройте страницу агента.</div>
             <div className="toolbar-wrap" style={{ marginTop: 10 }}>
@@ -180,6 +187,10 @@ export default function SyncPage({ remoteId, direction, localSiteId: routeLocalS
               <>
                 <div className="section-copy">
                   Pull будет выполнен в локальный сайт <strong style={{ color: 'var(--fg)' }}>{quickTargetSite?.name ?? 'выбранный сайт'}</strong>.
+                </div>
+                <div className="toolbar-wrap" style={{ marginBottom: 10 }}>
+                  <button type="button" className={`btn btn-sm ${syncMode === 'incremental' ? 'btn-primary' : 'btn-secondary'}`} onClick={() => setSyncMode('incremental')}>Только изменённые</button>
+                  <button type="button" className={`btn btn-sm ${syncMode === 'full' ? 'btn-primary' : 'btn-secondary'}`} onClick={() => setSyncMode('full')}>Полный sync</button>
                 </div>
                 <label className="checkbox-row"><input type="checkbox" checked={includeDb} onChange={() => setIncludeDb(!includeDb)} /> Включить базу данных</label>
                 <label className="checkbox-row"><input type="checkbox" checked={skipUploads} onChange={() => setSkipUploads(!skipUploads)} /> Не загружать медиа (wp-content/uploads)</label>
@@ -251,14 +262,40 @@ export default function SyncPage({ remoteId, direction, localSiteId: routeLocalS
                 )}
 
                 <div className="stack-sm">
+                  <div className="toolbar-wrap" style={{ marginBottom: 4 }}>
+                    <button type="button" className={`btn btn-sm ${syncMode === 'incremental' ? 'btn-primary' : 'btn-secondary'}`} onClick={() => setSyncMode('incremental')}>Только изменённые</button>
+                    <button type="button" className={`btn btn-sm ${syncMode === 'full' ? 'btn-primary' : 'btn-secondary'}`} onClick={() => setSyncMode('full')}>Полный sync</button>
+                  </div>
+                  <div className="form-hint">
+                    «Только изменённые» хранит manifest и переносит новые/изменённые файлы, а также удаления после последнего успешного sync.
+                  </div>
                   <label className="checkbox-row"><input type="checkbox" checked={includeDb} onChange={() => setIncludeDb(!includeDb)} /> Включить базу данных</label>
                   {isPull && <label className="checkbox-row"><input type="checkbox" checked={skipUploads} onChange={() => setSkipUploads(!skipUploads)} /> Не загружать медиа (wp-content/uploads)</label>}
                   {!isPull && <label className="checkbox-row"><input type="checkbox" checked={devMode} onChange={() => setDevMode(!devMode)} /> Быстрый режим разработки</label>}
                   {includeDb && <label className="checkbox-row"><input type="checkbox" checked={preserveCredentials} onChange={() => setPreserveCredentials(!preserveCredentials)} /> Сохранить учётные данные</label>}
                 </div>
+
+                <div className="form-hint" style={{ marginTop: 10 }}>
+                  Если сервер был очищен или sync считает файлы уже перенесёнными — сбросьте состояние: следующий {isPull ? 'Pull' : 'Push'} перенесёт всё с нуля.
+                </div>
+                <div className="toolbar-wrap">
+                  <button
+                    type="button"
+                    className="btn btn-secondary btn-sm"
+                    disabled={!(boundLocalSiteId ?? localSiteId)}
+                    onClick={() => vscode.postMessage({ type: 'resetSyncState', payload: { remoteId, localSiteId: boundLocalSiteId ?? localSiteId } })}
+                  >
+                    Сбросить состояние sync (начать заново)
+                  </button>
+                </div>
               </>
             )}
 
+            {remote.fileTransferMode === 'ftp' && includeDb && (
+              <div className="card" style={{ background: 'rgba(241,184,76,0.08)', borderColor: 'var(--yellow)', marginTop: 12 }}>
+                <div className="section-copy">В FTP-режиме БД синхронизируется через временный PHP bridge: WPDock загрузит одноразовый PHP-файл, выполнит экспорт/импорт и удалит его.</div>
+              </div>
+            )}
             {isPull && <div className="card" style={{ background: 'rgba(241,76,76,0.05)', borderColor: 'var(--red)', marginTop: 12 }}><div className="section-copy" style={{ color: 'var(--red)' }}>⚠ Pull перезапишет локальные файлы{includeDb ? ' и базу данных' : ''}</div></div>}
           </div>
 
@@ -273,7 +310,7 @@ export default function SyncPage({ remoteId, direction, localSiteId: routeLocalS
               <>
                 <button className="btn btn-secondary" onClick={() => navigate({ name: 'home' })}>Отмена</button>
                 <button className="btn btn-secondary" onClick={() => { setSyncing(false); setDone(false); setSteps([]); }}>Сбросить</button>
-                <button className="btn btn-primary" onClick={handleSync} disabled={!remote.agentInstalled || ((!isPull || targetMode === 'existing') && !(boundLocalSiteId ?? localSiteId))}>
+                <button className="btn btn-primary" onClick={handleSync} disabled={(remote.fileTransferMode !== 'ftp' && !remote.agentInstalled) || ((!isPull || targetMode === 'existing') && !(boundLocalSiteId ?? localSiteId))}>
                   {isPull ? (targetMode === 'new' ? 'Создать и Pull' : 'Начать Pull') : 'Начать Push'}
                 </button>
               </>

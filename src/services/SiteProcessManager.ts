@@ -210,9 +210,6 @@ export class SiteProcessManager {
     if (preferredServer === 'nginx' || preferredServer === 'apache') {
       try {
         if (preferredServer === 'nginx') {
-          if (os.platform() === 'win32') {
-            await this.killStaleNginxWindows();
-          }
           await this.startNginx(site);
         } else {
           await this.startApache(site);
@@ -233,14 +230,6 @@ export class SiteProcessManager {
     }
 
     Logger.log(`[site] «${site.name}» запущен.`);
-  }
-
-  private killStaleNginxWindows(): Promise<void> {
-    if (os.platform() !== 'win32') {return Promise.resolve();}
-    const ps = `Get-Process nginx -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue`;
-    return new Promise((resolve) => {
-      cp.exec(`powershell -NoProfile -ExecutionPolicy Bypass -Command "${ps}"`, () => resolve());
-    });
   }
 
   /** Stop the PHP built-in server (and web server) for this site. */

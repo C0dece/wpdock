@@ -542,6 +542,61 @@ export class DashboardPanel implements vscode.WebviewViewProvider {
         }
         break;
 
+      case 'cleanupRemoteUploads':
+        try {
+          const remote = this.remoteService.getRemote(payload.remoteId);
+          if (payload.skipConfirm !== true) {
+            const confirm = await vscode.window.showWarningMessage(
+              `Очистить остатки незавершённых Push-загрузок на "${remote?.name ?? ''}"?`,
+              {
+                modal: true,
+                detail:
+                  'Будут удалены временные chunks, собранные ZIP/SQL и resumable upload-токены WPDock на удалённом сервере.\n\n' +
+                  'Используйте это, если передумали продолжать прерванный Push. Уже распакованные файлы сайта и импортированная БД не затрагиваются.',
+              },
+              'Очистить остатки'
+            );
+            if (confirm !== 'Очистить остатки') {break;}
+          }
+          this.postMessage({ type: 'progress', message: 'Очистка остатков Push...' });
+          const result = await this.remoteService.cleanupRemoteUploadResidue(payload.remoteId, (msg) => {
+            this.postMessage({ type: 'progress', message: msg });
+          });
+          this.postMessage({ type: 'remoteUploadResidueCleaned', remoteId: payload.remoteId, result });
+          await this.sendFullState();
+        } catch (err: any) {
+          Logger.error(`[Dashboard] cleanupRemoteUploads failed remoteId=${payload?.remoteId}`, err);
+          this.postMessage({ type: 'error', message: err.message });
+        }
+        break;
+
+      case 'resetSyncState':
+        try {
+          const remote = this.remoteService.getRemote(payload.remoteId);
+          const site = this.siteManager.getSite(payload.localSiteId);
+          if (!site) { throw new Error('Локальный сайт не найден'); }
+          const wpRoot = this.siteManager.getSiteWpRoot(site);
+          if (payload.skipConfirm !== true) {
+            const confirm = await vscode.window.showWarningMessage(
+              `Сбросить состояние синхронизации с "${remote?.name ?? ''}"?`,
+              {
+                modal: true,
+                detail:
+                  'Будут удалены локальные отметки о перенесённых файлах (resume) и manifest последнего sync.\n\n' +
+                  'Следующий Push/Pull перенесёт все файлы заново, с нуля. Файлы на сервере и локально не удаляются.',
+              },
+              'Сбросить'
+            );
+            if (confirm !== 'Сбросить') { break; }
+          }
+          const result = this.remoteService.resetSyncState(payload.remoteId, wpRoot);
+          this.postMessage({ type: 'syncStateReset', remoteId: payload.remoteId, localSiteId: payload.localSiteId, removed: result.removed });
+        } catch (err: any) {
+          Logger.error(`[Dashboard] resetSyncState failed remoteId=${payload?.remoteId}`, err);
+          this.postMessage({ type: 'error', message: err.message });
+        }
+        break;
+
       case 'resetRemoteWp':
         try {
           const remote = this.remoteService.getRemote(payload.remoteId);
@@ -606,7 +661,8 @@ export class DashboardPanel implements vscode.WebviewViewProvider {
               this.postMessage({ type: 'syncProgress', phase, message: msg, percent: pct, operationId: op.token.id, cancellable: true });
             },
             site.path,  // dbOutPath: write database.sql / database.meta.json to site root, not public/
-            payload.skipUploads === true
+            payload.skipUploads === true,
+            payload.syncMode === 'incremental'
           );
           this.siteManager.normalizeSiteLayout(site);
           let pullDiagnosticSummary = '';
@@ -689,7 +745,8 @@ export class DashboardPanel implements vscode.WebviewViewProvider {
               this.postMessage({ type: 'syncProgress', phase, message: msg, percent: pct, operationId: op.token.id, cancellable: true });
             },
             sqlPath,  // dbFilePath: database.sql lives in site root, not in wpRoot (public/)
-            payload.preserveCredentials ?? true
+            payload.preserveCredentials ?? true,
+            payload.syncMode === 'incremental'
           );
           this.remoteService.addLinkedSite(payload.remoteId, site.id);
           this.siteManager.addRemoteLink(site.id, payload.remoteId);
@@ -1381,6 +1438,7 @@ export class DashboardPanel implements vscode.WebviewViewProvider {
             defaultPhpVersion:    cfg.get<string>('defaultPhpVersion') ?? '8.2',
             directUploadLimitMb:  upload.get<number>('directUploadLimitMb') ?? 1,
             chunkSizeMb:          upload.get<number>('chunkSizeMb') ?? 0.75,
+            uploadConcurrency:    upload.get<number>('concurrency') ?? 8,
             autoBackup:           backup.get<boolean>('autoBackup') ?? false,
             backupIntervalHours:  backup.get<number>('intervalHours') ?? 24,
             backupKeepCount:      backup.get<number>('keepCount') ?? 5,
@@ -1396,6 +1454,7 @@ export class DashboardPanel implements vscode.WebviewViewProvider {
             defaultPhpVersion: string;
             directUploadLimitMb: number;
             chunkSizeMb: number;
+            uploadConcurrency?: number;
             autoBackup: boolean;
             backupIntervalHours: number;
             backupKeepCount: number;
@@ -1408,6 +1467,7 @@ export class DashboardPanel implements vscode.WebviewViewProvider {
           await cfg.update('defaultPhpVersion', s.defaultPhpVersion, t);
           await upload.update('directUploadLimitMb', s.directUploadLimitMb, t);
           await upload.update('chunkSizeMb',         s.chunkSizeMb,         t);
+          await upload.update('concurrency',         s.uploadConcurrency ?? 8, t);
           await backup.update('autoBackup',       s.autoBackup,           t);
           await backup.update('intervalHours',    s.backupIntervalHours,  t);
           await backup.update('keepCount',        s.backupKeepCount,      t);

@@ -1,0 +1,7 @@
+node_modules/
+out/
+webview-ui/node_modules/
+webview-ui/dist/
+*.vsix
+*.log
+.DS_Store

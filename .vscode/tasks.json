@@ -1,0 +1,64 @@
+{
+  "version": "2.0.0",
+  "tasks": [
+    {
+      "label": "compile-only",
+      "type": "npm",
+      "script": "compile",
+      "group": "build",
+      "presentation": { "reveal": "silent" },
+      "problemMatcher": ["$tsc"]
+    },
+    {
+      "label": "watch",
+      "type": "npm",
+      "script": "watch",
+      "group": "build",
+      "presentation": { "reveal": "silent" },
+      "isBackground": true,
+      "problemMatcher": ["$tsc-watch"]
+    },
+    {
+      "label": "watch:webview",
+      "type": "npm",
+      "script": "watch:webview",
+      "group": "build",
+      "presentation": { "reveal": "silent" },
+      "isBackground": true
+    },
+    {
+      "label": "pack-agent",
+      "type": "shell",
+      "command": "node scripts/pack-agent.js",
+      "group": "build",
+      "presentation": { "reveal": "always" }
+    },
+    {
+      "label": "build",
+      "type": "shell",
+      "command": "powershell -ExecutionPolicy Bypass -File scripts/deploy-local.ps1",
+      "group": {
+        "kind": "build",
+        "isDefault": true
+      },
+      "presentation": {
+        "reveal": "always",
+        "panel": "dedicated",
+        "clear": true
+      },
+      "problemMatcher": []
+    },
+    {
+      "label": "Deploy to VS Code (local)",
+      "type": "shell",
+      "command": "powershell -ExecutionPolicy Bypass -File scripts/deploy-local.ps1",
+      "group": "build",
+      "presentation": {
+        "reveal": "always",
+        "panel": "dedicated",
+        "clear": true
+      },
+      "problemMatcher": []
+    }
+  ]
+}
